@@ -80,7 +80,7 @@ pub enum TransferEvent {
     /// 共享失败
     ShareFailed { id: usize, reason: String },
     /// 下载开始
-    DownloadStarted { id: usize, name: String },
+    DownloadStarted { id: usize, name: String, device_addr: SocketAddr, info_hash: String },
     /// 下载进度
     DownloadProgress { id: usize, progress: f64 },
     /// 下载完成
@@ -539,6 +539,18 @@ impl App {
             .map(|d| d.name.clone())
             .unwrap_or_else(|| "未知设备".to_string());
 
+        // 获取设备地址和端口
+        let device_addr = self.viewing_device.as_ref()
+            .and_then(|d| d.get_address(false))
+            .or_else(|| self.viewing_device.as_ref().and_then(|d| d.get_address(true)))
+            .cloned()
+            .unwrap_or_else(|| {
+                let port = self.viewing_device.as_ref()
+                    .and_then(|d| d.get_bt_port())
+                    .unwrap_or(6881);
+                SocketAddr::from(([0, 0, 0, 0], port))
+            });
+
         // 分配任务 ID
         let task_id = self.allocate_task_id();
 
@@ -557,6 +569,8 @@ impl App {
         let _ = self.transfer_tx.try_send(TransferEvent::DownloadStarted {
             id: task_id,
             name: shared_file.name.clone(),
+            device_addr,
+            info_hash: shared_file.info_hash.clone(),
         });
 
         tracing::info!("开始下载: {} from {}", shared_file.name, device_name);
@@ -590,7 +604,7 @@ impl App {
                             task.status = TransferStatus::Failed { reason };
                         }
                     }
-                    TransferEvent::DownloadStarted { id, name } => {
+                    TransferEvent::DownloadStarted { id, name, device_addr: _, info_hash: _ } => {
                         tracing::info!("下载开始: id={}, name={}", id, name);
                         if let Some(task) = self.transfers.iter_mut().find(|t| t.id == id) {
                             task.status = TransferStatus::Downloading { progress: 0.0 };
@@ -1048,6 +1062,7 @@ pub async fn run_tui() -> Result<()> {
 async fn transfer_service_handler(mut rx: mpsc::Receiver<TransferEvent>, tx: mpsc::Sender<TransferEvent>) {
     let mut pending_shares: HashMap<usize, PathBuf> = HashMap::new();
     let mut active_seeders: HashMap<PathBuf, (Arc<TorrentFile>, tokio::task::JoinHandle<()>)> = HashMap::new();
+    let mut active_downloads: HashMap<usize, tokio::task::JoinHandle<()>> = HashMap::new();
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -1111,8 +1126,38 @@ async fn transfer_service_handler(mut rx: mpsc::Receiver<TransferEvent>, tx: mps
                     }
                 }
             }
+            TransferEvent::DownloadStarted { id, name, device_addr, info_hash } => {
+                tracing::info!("开始处理下载请求: id={}, name={}, addr={}, hash={}",
+                    id, name, device_addr, info_hash);
+
+                // 启动下载任务
+                let tx_clone = tx.clone();
+                let handle = tokio::spawn(async move {
+                    // 简化的下载模拟
+                    // TODO: 实现真正的 BitTorrent 下载逻辑
+                    let total_pieces = 100;
+                    for piece in 0..total_pieces {
+                        // 模拟下载延迟
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                        let progress = (piece + 1) as f64 / total_pieces as f64;
+                        let _ = tx_clone.send(TransferEvent::DownloadProgress {
+                            id,
+                            progress,
+                        });
+
+                        tracing::debug!("下载进度: {} - {:.1}%", name, progress * 100.0);
+                    }
+
+                    // 下载完成
+                    let _ = tx_clone.send(TransferEvent::DownloadCompleted { id });
+                    tracing::info!("下载完成: id={}, name={}", id, name);
+                });
+
+                active_downloads.insert(id, handle);
+            }
             _ => {
-                // 其他事件暂不处理
+                // 其他事件已经在 App 中处理
             }
         }
     }
