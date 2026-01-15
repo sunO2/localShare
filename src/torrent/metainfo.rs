@@ -335,11 +335,161 @@ impl TorrentMetaInfo {
         Ok(BencodeValue::Dict(dict).encode())
     }
 
-    /// 从 bencode 数据解析（简化版本，仅支持基本功能）
+    /// 从 bencode 数据解析
     pub fn from_bencode(data: &[u8]) -> Result<Self> {
-        // 简化的解析 - 实际应用中需要完整的 bencode 解析器
-        // 这里返回一个基本的实现，主要用于创建 torrent
-        Err(Error::Other("Bencode decoding not implemented yet".to_string()))
+        use crate::torrent::bencode::BencodeValue;
+
+        // 辅助函数：从字典中查找键
+        fn get_dict_value<'a>(dict: &'a BTreeMap<Vec<u8>, BencodeValue>, key: &[u8]) -> Option<&'a BencodeValue> {
+            dict.iter().find(|(k, _)| k.as_slice() == key).map(|(_, v)| v)
+        }
+
+        // 辅助函数：提取字符串值
+        fn extract_string(value: &BencodeValue) -> Option<String> {
+            match value {
+                BencodeValue::String(s) => Some(s.clone()),
+                BencodeValue::Bytes(b) => String::from_utf8(b.clone()).ok(),
+                _ => None,
+            }
+        }
+
+        // 辅助函数：提取整数值
+        fn extract_int(value: &BencodeValue) -> Option<i64> {
+            match value {
+                BencodeValue::Int(i) => Some(*i),
+                _ => None,
+            }
+        }
+
+        // 解码 bencode
+        let (value, _) = BencodeValue::decode(data)
+            .map_err(|e| Error::Other(format!("Failed to decode bencode: {}", e)))?;
+
+        // 顶级必须是字典
+        let dict = match value {
+            BencodeValue::Dict(d) => d,
+            _ => return Err(Error::Other("Invalid torrent format: not a dict".to_string())),
+        };
+
+        // 提取 announce (可选)
+        let announce = get_dict_value(&dict, b"announce").and_then(extract_string);
+
+        // 提取 created_by (可选)
+        let created_by = get_dict_value(&dict, b"created by").and_then(extract_string);
+
+        // 提取 creation_date (可选)
+        let creation_date = get_dict_value(&dict, b"creation date").and_then(extract_int);
+
+        // 提取 encoding (可选)
+        let encoding = get_dict_value(&dict, b"encoding").and_then(extract_string);
+
+        // 提取 info 字典 (必需)
+        let info_value = get_dict_value(&dict, b"info")
+            .ok_or_else(|| Error::Other("Missing 'info' dictionary".to_string()))?;
+
+        let info_dict = match info_value {
+            BencodeValue::Dict(d) => d,
+            _ => return Err(Error::Other("'info' is not a dictionary".to_string())),
+        };
+
+        // 提取 info.name (必需)
+        let name = get_dict_value(&info_dict, b"name")
+            .and_then(extract_string)
+            .ok_or_else(|| Error::Other("Missing 'info.name'".to_string()))?;
+
+        // 提取 info.piece_length (必需)
+        let piece_length = get_dict_value(&info_dict, b"piece length")
+            .and_then(extract_int)
+            .and_then(|i| if i > 0 && i <= u32::MAX as i64 { Some(i as u32) } else { None })
+            .ok_or_else(|| Error::Other("Missing or invalid 'info.piece length'".to_string()))?;
+
+        // 提取 info.pieces (必需)
+        let pieces = get_dict_value(&info_dict, b"pieces")
+            .and_then(|v| match v {
+                BencodeValue::Bytes(b) => Some(b.clone()),
+                BencodeValue::String(s) => Some(s.as_bytes().to_vec()),
+                _ => None,
+            })
+            .ok_or_else(|| Error::Other("Missing 'info.pieces'".to_string()))?;
+
+        // 提取 info.length (单文件) 或 info.files (多文件)
+        let length = get_dict_value(&info_dict, b"length")
+            .and_then(extract_int)
+            .and_then(|i| if i >= 0 { Some(i as u64) } else { None });
+
+        let files = if let Some(files_value) = get_dict_value(&info_dict, b"files") {
+            // 多文件模式
+            let files_list = match files_value {
+                BencodeValue::List(l) => l,
+                _ => return Err(Error::Other("'info.files' is not a list".to_string())),
+            };
+
+            let mut result = Vec::new();
+            for file_value in files_list {
+                let file_dict = match file_value {
+                    BencodeValue::Dict(d) => d,
+                    _ => return Err(Error::Other("File entry is not a dict".to_string())),
+                };
+
+                let length = get_dict_value(&file_dict, b"length")
+                    .and_then(extract_int)
+                    .and_then(|i| if i >= 0 { Some(i as u64) } else { None })
+                    .ok_or_else(|| Error::Other("Missing file length".to_string()))?;
+
+                let path_value = get_dict_value(&file_dict, b"path")
+                    .ok_or_else(|| Error::Other("Missing file path".to_string()))?;
+
+                let path = match path_value {
+                    BencodeValue::List(l) => {
+                        let mut path_vec = Vec::new();
+                        for p in l {
+                            if let BencodeValue::String(s) = p {
+                                path_vec.push(s.clone());
+                            } else if let BencodeValue::Bytes(b) = p {
+                                path_vec.push(String::from_utf8_lossy(b).to_string());
+                            }
+                        }
+                        path_vec
+                    }
+                    _ => return Err(Error::Other("File path is not a list".to_string())),
+                };
+
+                result.push(FileInfo {
+                    path,
+                    length,
+                    md5sum: None,
+                });
+            }
+            Some(result)
+        } else {
+            None
+        };
+
+        // 提取 info.private (可选)
+        let private = get_dict_value(&info_dict, b"private")
+            .and_then(extract_int)
+            .and_then(|i| if i >= 0 && i <= 255 { Some(i as u8) } else { None });
+
+        // 提取 info.md5sum (可选)
+        let md5sum = get_dict_value(&info_dict, b"md5sum").and_then(extract_string);
+
+        let info = TorrentInfo {
+            name,
+            piece_length,
+            pieces,
+            length,
+            files,
+            private,
+            md5sum,
+        };
+
+        Ok(TorrentMetaInfo {
+            announce,
+            created_by,
+            creation_date,
+            encoding,
+            info,
+        })
     }
 
     /// 获取 piece 数量

@@ -255,18 +255,8 @@ impl Message {
     }
 
     /// 从字节解析消息
-    pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.is_empty() {
-            // Keep-alive 消息
-            return Ok(Message::Unchoke); // 作为占位
-        }
-
-        let mut cursor = Cursor::new(data);
-
-        // 读取长度
-        let mut length_bytes = [0u8; 4];
-        cursor.read_exact(&mut length_bytes)?;
-        let length = u32::from_be_bytes(length_bytes) as usize;
+    pub fn from_bytes(len_bytes: &[u8], msg_bytes: &[u8]) -> Result<Self> {
+        let length = u32::from_be_bytes(<[u8; 4]>::try_from(len_bytes).unwrap_or([0u8; 4])) as usize;
 
         // 如果 length == 0，这是 keep-alive
         if length == 0 {
@@ -274,22 +264,23 @@ impl Message {
         }
 
         // 读取消息 ID
-        let mut message_id_byte = [0u8; 1];
-        cursor.read_exact(&mut message_id_byte)?;
-        let message_id = message_id_byte[0];
+        if msg_bytes.is_empty() {
+            return Ok(Message::Unchoke);
+        }
+
+        let message_id = msg_bytes[0];
 
         // 读取 payload
         let payload_length = length - 1;
-        let mut payload = vec![0u8; payload_length];
-        if payload_length > 0 {
-            cursor.read_exact(&mut payload)?;
-        }
+        let payload = if payload_length > 0 {
+            &msg_bytes[1..]
+        } else {
+            &[]
+        };
 
         // 解析消息
         let message_type = MessageType::from_byte(message_id)
             .ok_or_else(|| Error::Other(format!("Unknown message type: {}", message_id)))?;
-
-        let mut payload_cursor = Cursor::new(payload);
 
         match message_type {
             MessageType::Choke => Ok(Message::Choke),
@@ -297,64 +288,43 @@ impl Message {
             MessageType::Interested => Ok(Message::Interested),
             MessageType::NotInterested => Ok(Message::NotInterested),
             MessageType::Have => {
-                let mut index_bytes = [0u8; 4];
-                payload_cursor.read_exact(&mut index_bytes)?;
-                let index = u32::from_be_bytes(index_bytes) as usize;
+                if payload.len() < 4 {
+                    return Err(Error::Other("Invalid Have message".to_string()));
+                }
+                let index = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
                 Ok(Message::Have { index })
             }
             MessageType::Bitfield => {
-                let mut bitmap = vec![0u8; payload_length];
-                if payload_length > 0 {
-                    payload_cursor.read_exact(&mut bitmap)?;
-                }
+                let bitmap = payload.to_vec();
                 Ok(Message::Bitfield { bitmap })
             }
             MessageType::Request => {
-                let mut index_bytes = [0u8; 4];
-                let mut begin_bytes = [0u8; 4];
-                let mut length_bytes = [0u8; 4];
-
-                payload_cursor.read_exact(&mut index_bytes)?;
-                payload_cursor.read_exact(&mut begin_bytes)?;
-                payload_cursor.read_exact(&mut length_bytes)?;
-
+                if payload.len() < 12 {
+                    return Err(Error::Other("Invalid Request message".to_string()));
+                }
                 Ok(Message::Request {
-                    index: u32::from_be_bytes(index_bytes),
-                    begin: u32::from_be_bytes(begin_bytes),
-                    length: u32::from_be_bytes(length_bytes),
+                    index: u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]),
+                    begin: u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
+                    length: u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]),
                 })
             }
             MessageType::Piece => {
-                let mut index_bytes = [0u8; 4];
-                let mut begin_bytes = [0u8; 4];
-
-                payload_cursor.read_exact(&mut index_bytes)?;
-                payload_cursor.read_exact(&mut begin_bytes)?;
-
-                let index = u32::from_be_bytes(index_bytes);
-                let begin = u32::from_be_bytes(begin_bytes);
-
-                let block_size = payload_length - 8;
-                let mut block = vec![0u8; block_size];
-                if block_size > 0 {
-                    payload_cursor.read_exact(&mut block)?;
+                if payload.len() < 8 {
+                    return Err(Error::Other("Invalid Piece message".to_string()));
                 }
-
+                let index = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let begin = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                let block = payload[8..].to_vec();
                 Ok(Message::Piece { index, begin, block })
             }
             MessageType::Cancel => {
-                let mut index_bytes = [0u8; 4];
-                let mut begin_bytes = [0u8; 4];
-                let mut length_bytes = [0u8; 4];
-
-                payload_cursor.read_exact(&mut index_bytes)?;
-                payload_cursor.read_exact(&mut begin_bytes)?;
-                payload_cursor.read_exact(&mut length_bytes)?;
-
+                if payload.len() < 12 {
+                    return Err(Error::Other("Invalid Cancel message".to_string()));
+                }
                 Ok(Message::Cancel {
-                    index: u32::from_be_bytes(index_bytes),
-                    begin: u32::from_be_bytes(begin_bytes),
-                    length: u32::from_be_bytes(length_bytes),
+                    index: u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]),
+                    begin: u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
+                    length: u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]),
                 })
             }
         }

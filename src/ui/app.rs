@@ -4,7 +4,8 @@ use super::file_browser::FileBrowser;
 use sharSelf::discovery::{discovery_service, register_service, DiscoveryEvent, DeviceInfo, SharedFile};
 use sharSelf::common::config::{DiscoveryConfig, ServiceConfig};
 use sharSelf::common::error::Result;
-use sharSelf::torrent::{TorrentFile, PieceManager, Seeder, Downloader, DEFAULT_BT_PORT};
+use sharSelf::torrent::{TorrentFile, TorrentMetaInfo, PieceManager, Seeder, Downloader, DEFAULT_BT_PORT};
+use sharSelf::torrent::metadata::{init_global_metadata_server, global_metadata_server};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -1144,6 +1145,17 @@ fn format_size(size: u64) -> String {
 
 /// 运行 TUI 应用
 pub async fn run_tui() -> Result<()> {
+    // 初始化全局元数据服务器
+    init_global_metadata_server();
+
+    // 启动元数据服务器（端口 8080）
+    let metadata_server = global_metadata_server();
+    let metadata_server_handle = tokio::spawn(async move {
+        if let Err(e) = metadata_server.start(8080).await {
+            tracing::error!("元数据服务器错误: {}", e);
+        }
+    });
+
     // 初始化终端
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1182,6 +1194,10 @@ pub async fn run_tui() -> Result<()> {
 
     // 取消传输服务
     transfer_service.abort();
+
+    // 停止元数据服务器
+    metadata_server.stop().await;
+    metadata_server_handle.abort();
 
     // 恢复终端
     disable_raw_mode()?;
@@ -1224,6 +1240,23 @@ async fn transfer_service_handler(
                         let file_name = torrent.metainfo.info.name.clone();
                         tracing::info!("文件名: {}", file_name);
                         tracing::info!("Info Hash: {}", info_hash);
+
+                        // 编码 torrent 数据为 bencode
+                        let torrent_data = match torrent.metainfo.to_bencode() {
+                            Ok(data) => data,
+                            Err(e) => {
+                                tracing::error!("✗ Torrent 编码失败: {}", e);
+                                let _ = event_back_tx.send(TransferEvent::ShareFailed {
+                                    id,
+                                    reason: e.to_string(),
+                                });
+                                continue;
+                            }
+                        };
+
+                        // 注册到元数据服务器
+                        global_metadata_server().add_torrent(info_hash.clone(), torrent_data).await;
+                        tracing::info!("✓ 已注册到元数据服务器");
 
                         // 创建 PieceManager
                         let storage_path = if path.is_dir() {
@@ -1283,29 +1316,120 @@ async fn transfer_service_handler(
                 tracing::info!("开始处理下载请求: id={}, name={}, addr={}, hash={}",
                     id, name, device_addr, info_hash);
 
-                // 启动下载任务
                 let tx_clone = event_back_tx.clone();
+                let info_hash_clone = info_hash.clone();
                 let handle = tokio::spawn(async move {
                     tracing::info!("=== 下载任务开始 ===");
-                    // 简化的下载模拟
-                    // TODO: 实现真正的 BitTorrent 下载逻辑
-                    let total_pieces = 100;
-                    for piece in 0..total_pieces {
-                        // 模拟下载延迟
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    tracing::info!("连接到: {}", device_addr);
+                    tracing::info!("Info Hash: {}", info_hash_clone);
 
-                        let progress = (piece + 1) as f64 / total_pieces as f64;
-                        tracing::info!("发送进度更新: id={}, progress={:.1}%", id, progress * 100.0);
-                        let _ = tx_clone.send(TransferEvent::DownloadProgress {
+                    // 创建下载器事件通道
+                    let (download_event_tx, mut download_event_rx) = mpsc::channel::<sharSelf::torrent::downloader::DownloadEvent>(100);
+
+                    // 启动事件转换任务
+                    let tx_for_events = tx_clone.clone();
+                    let task_id = id;
+                    tokio::spawn(async move {
+                        while let Some(event) = download_event_rx.recv().await {
+                            let transfer_event = match event {
+                                sharSelf::torrent::downloader::DownloadEvent::Connected { .. } => {
+                                    // 连接成功，开始下载
+                                    Some(TransferEvent::DownloadProgress { id: task_id, progress: 0.0 })
+                                }
+                                sharSelf::torrent::downloader::DownloadEvent::PieceCompleted { .. } => {
+                                    // Piece 完成，由进度更新处理
+                                    None
+                                }
+                                sharSelf::torrent::downloader::DownloadEvent::DownloadComplete => {
+                                    Some(TransferEvent::DownloadCompleted { id: task_id })
+                                }
+                                sharSelf::torrent::downloader::DownloadEvent::DownloadFailed { reason } => {
+                                    Some(TransferEvent::DownloadFailed { id: task_id, reason })
+                                }
+                                sharSelf::torrent::downloader::DownloadEvent::Progress { percent } => {
+                                    Some(TransferEvent::DownloadProgress { id: task_id, progress: percent / 100.0 })
+                                }
+                                sharSelf::torrent::downloader::DownloadEvent::PeerDisconnected { .. } => {
+                                    // Peer 断开连接
+                                    None
+                                }
+                            };
+
+                            if let Some(evt) = transfer_event {
+                                let _ = tx_for_events.send(evt).await;
+                            }
+                        }
+                    });
+
+                    // 步骤 1: 从 peer 获取 torrent 元数据
+                    let metadata_data = match Downloader::fetch_metadata(device_addr, &info_hash_clone).await {
+                        Ok(data) => {
+                            tracing::info!("成功获取元数据，大小: {} bytes", data.len());
+                            data
+                        }
+                        Err(e) => {
+                            tracing::error!("获取元数据失败: {}", e);
+                            let _ = tx_clone.send(TransferEvent::DownloadFailed {
+                                id,
+                                reason: format!("获取元数据失败: {}", e),
+                            });
+                            return;
+                        }
+                    };
+
+                    // 步骤 2: 解析元数据
+                    let metainfo = match TorrentMetaInfo::from_bencode(&metadata_data) {
+                        Ok(m) => {
+                            tracing::info!("成功解析元数据: {} ({})",
+                                m.info.name, format_size(m.total_size()));
+                            m
+                        }
+                        Err(e) => {
+                            tracing::error!("解析元数据失败: {}", e);
+                            let _ = tx_clone.send(TransferEvent::DownloadFailed {
+                                id,
+                                reason: format!("解析元数据失败: {}", e),
+                            });
+                            return;
+                        }
+                    };
+
+                    // 步骤 3: 创建 PieceManager
+                    let download_dir = std::path::PathBuf::from("/tmp/shareself_downloads");
+                    let _ = std::fs::create_dir_all(&download_dir);
+
+                    let piece_manager = Arc::new(PieceManager::new(
+                        metainfo.clone(),
+                        download_dir.clone(),
+                    ));
+
+                    // 步骤 4: 创建 Downloader
+                    let downloader = match Downloader::new(
+                        metainfo.clone(),
+                        piece_manager.clone(),
+                        download_event_tx,
+                        download_dir,
+                    ) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::error!("创建下载器失败: {}", e);
+                            let _ = tx_clone.send(TransferEvent::DownloadFailed {
+                                id,
+                                reason: format!("创建下载器失败: {}", e),
+                            });
+                            return;
+                        }
+                    };
+
+                    // 步骤 5: 开始下载
+                    tracing::info!("开始下载，连接到: {}", device_addr);
+                    if let Err(e) = downloader.start_download(device_addr).await {
+                        tracing::error!("启动下载失败: {}", e);
+                        let _ = tx_clone.send(TransferEvent::DownloadFailed {
                             id,
-                            progress,
+                            reason: format!("启动下载失败: {}", e),
                         });
                     }
-
-                    // 下载完成
-                    tracing::info!("发送下载完成事件: id={}", id);
-                    let _ = tx_clone.send(TransferEvent::DownloadCompleted { id });
-                    tracing::info!("下载完成: id={}, name={}", id, name);
                 });
 
                 active_downloads.insert(id, handle);

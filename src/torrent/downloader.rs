@@ -3,17 +3,23 @@
 //! 从 peers 下载文件
 
 use crate::torrent::metainfo::TorrentMetaInfo;
-use crate::torrent::piece::PieceManager;
+use crate::torrent::piece::{PieceManager, PieceState};
 use crate::torrent::protocol::Message;
 use crate::torrent::peer::PeerConnection;
-use crate::common::error::Result;
+use crate::common::error::{Error, Result};
 use std::sync::Arc;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, sleep};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 /// 下载事件
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
+    /// 连接到 peer
+    Connected { peer: String },
+
     /// Piece 下载完成
     PieceCompleted { index: usize },
 
@@ -23,8 +29,11 @@ pub enum DownloadEvent {
     /// 下载失败
     DownloadFailed { reason: String },
 
-    /// 进度更新
-    Progress { completed: usize, total: usize },
+    /// 进度更新 (百分比 0.0-100.0)
+    Progress { percent: f64 },
+
+    /// Peer 断开连接
+    PeerDisconnected { peer: String },
 }
 
 /// 下载器
@@ -40,6 +49,12 @@ pub struct Downloader {
 
     /// Peer ID
     peer_id: [u8; 20],
+
+    /// Info hash
+    info_hash: [u8; 20],
+
+    /// 存储路径
+    storage_path: PathBuf,
 }
 
 impl Downloader {
@@ -48,40 +63,95 @@ impl Downloader {
         metainfo: TorrentMetaInfo,
         piece_manager: Arc<PieceManager>,
         event_tx: mpsc::Sender<DownloadEvent>,
-    ) -> Self {
+        storage_path: PathBuf,
+    ) -> Result<Self> {
         let peer_id = Self::generate_peer_id();
+        let info_hash = metainfo.info_hash()?;
 
-        Downloader {
+        Ok(Downloader {
             metainfo,
             piece_manager,
             event_tx,
             peer_id,
+            info_hash,
+            storage_path,
+        })
+    }
+
+    /// 从 peer 获取 torrent 元数据
+    pub async fn fetch_metadata(peer_addr: std::net::SocketAddr, info_hash_hex: &str) -> Result<Vec<u8>> {
+        tracing::info!("从 {} 获取元数据，hash: {}", peer_addr, info_hash_hex);
+
+        // 连接到元数据端口 (8080)
+        let metadata_port = 8080;
+        let metadata_addr = std::net::SocketAddr::new(peer_addr.ip(), metadata_port);
+
+        match timeout(Duration::from_secs(5), TcpStream::connect(metadata_addr)).await {
+            Ok(Ok(mut stream)) => {
+                // 发送请求: 格式为 "GET /<info_hash>\n"
+                let request = format!("GET /{}\n", info_hash_hex);
+                stream.write_all(request.as_bytes()).await
+                    .map_err(|e| Error::Network(format!("Failed to send metadata request: {}", e)))?;
+
+                // 读取响应长度 (4 字节)
+                let mut len_bytes = [0u8; 4];
+                stream.read_exact(&mut len_bytes).await
+                    .map_err(|e| Error::Network(format!("Failed to read metadata length: {}", e)))?;
+                let len = u32::from_be_bytes(len_bytes) as usize;
+
+                if len == 0 || len > 10 * 1024 * 1024 { // 最大 10MB
+                    return Err(Error::Other("Invalid metadata size".to_string()));
+                }
+
+                // 读取元数据
+                let mut metadata = vec![0u8; len];
+                stream.read_exact(&mut metadata).await
+                    .map_err(|e| Error::Network(format!("Failed to read metadata: {}", e)))?;
+
+                tracing::info!("成功获取 {} 字节的元数据", metadata.len());
+                Ok(metadata)
+            }
+            Ok(Err(e)) => {
+                Err(Error::Network(format!("Failed to connect to metadata server: {}", e)))
+            }
+            Err(_) => {
+                Err(Error::Timeout)
+            }
         }
     }
 
-    /// 添加 peer 并开始下载
-    pub async fn add_peer(&self, addr: std::net::SocketAddr) -> Result<()> {
-        let info_hash = self.metainfo.info_hash()?;
+    /// 启动下载（连接到单个 peer）
+    pub async fn start_download(&self, addr: std::net::SocketAddr) -> Result<()> {
+        tracing::info!("=== 开始下载 ===");
+        tracing::info!("连接到: {}", addr);
+        tracing::info!("Info Hash: {}", hex::encode(self.info_hash));
+
+        let info_hash = self.info_hash;
         let peer_id = self.peer_id;
         let piece_manager = Arc::clone(&self.piece_manager);
         let event_tx = self.event_tx.clone();
+        let metainfo = self.metainfo.clone();
+        let storage_path = self.storage_path.clone();
 
         tokio::spawn(async move {
-            match PeerConnection::connect(addr, info_hash, peer_id).await {
-                Ok(mut peer) => {
-                    if let Err(e) = Self::download_from_peer(
-                        &mut peer,
-                        &piece_manager,
-                        &event_tx,
-                    ).await {
-                        tracing::warn!("Download from {} failed: {}", addr, e);
-                        let _ = event_tx.send(DownloadEvent::DownloadFailed {
-                            reason: format!("Peer {} error: {}", addr, e),
-                        }).await;
-                    }
+            match Self::download_from_peer(
+                addr,
+                info_hash,
+                peer_id,
+                piece_manager,
+                event_tx.clone(),
+                metainfo,
+                storage_path,
+            ).await {
+                Ok(_) => {
+                    tracing::info!("下载完成");
+                    let _ = event_tx.send(DownloadEvent::DownloadComplete).await;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to connect to {}: {}", addr, e);
+                    tracing::error!("下载失败: {}", e);
+                    let _ = event_tx.send(DownloadEvent::DownloadFailed {
+                        reason: e.to_string(),
+                    }).await;
                 }
             }
         });
@@ -91,79 +161,185 @@ impl Downloader {
 
     /// 从单个 peer 下载
     async fn download_from_peer(
-        peer: &mut PeerConnection,
-        piece_manager: &Arc<PieceManager>,
-        event_tx: &mpsc::Sender<DownloadEvent>,
+        addr: std::net::SocketAddr,
+        info_hash: [u8; 20],
+        peer_id: [u8; 20],
+        piece_manager: Arc<PieceManager>,
+        event_tx: mpsc::Sender<DownloadEvent>,
+        metainfo: TorrentMetaInfo,
+        storage_path: PathBuf,
     ) -> Result<()> {
+        // 连接到 peer
+        let mut peer = PeerConnection::connect(addr, info_hash, peer_id).await
+            .map_err(|e| {
+                tracing::error!("连接失败: {}", e);
+                e
+            })?;
+
+        tracing::info!("已连接到 peer: {}", addr);
+        let _ = event_tx.send(DownloadEvent::Connected {
+            peer: addr.to_string(),
+        }).await;
+
+        // 获取 piece 数量
+        let piece_count = piece_manager.piece_count().await;
+        let total_size = metainfo.total_size();
+        let piece_length = metainfo.info.piece_length;
+
+        tracing::info!("文件大小: {} bytes, piece 数量: {}, piece 大小: {}",
+            total_size, piece_count, piece_length);
+
+        // 等待 peer 发送 bitfield
+        sleep(Duration::from_millis(100)).await;
+
+        // 获取 peer 拥有的 pieces
+        let peer_pieces = peer.get_have_pieces().await;
+        tracing::info!("Peer 拥有 {} 个 pieces", peer_pieces.len());
+
         // 发送 interested
         peer.send_interested().await?;
 
-        // 获取需要的 pieces
-        let piece_count = piece_manager.piece_count().await;
-        let info_hash = /* 需要传入 */ [0u8; 20];
+        // 等待 unchoke
+        let mut unchoked = false;
+        for _ in 0..10 {
+            match timeout(Duration::from_secs(2), peer.recv()).await {
+                Ok(Ok(Message::Unchoke)) => {
+                    unchoked = true;
+                    tracing::info!("收到 unchoke");
+                    break;
+                }
+                Ok(Ok(msg)) => {
+                    tracing::debug!("收到其他消息: {:?}", std::mem::discriminant(&msg));
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    tracing::warn!("等待 unchoke 超时，重试...");
+                }
+            }
+        }
 
-        // 简化的下载逻辑：按顺序下载
-        for i in 0..piece_count {
+        if !unchoked {
+            return Err(Error::Other("Peer 未发送 unchoke".to_string()));
+        }
+
+        // 开始下载 pieces
+        let block_size = 16 * 1024; // 16KB
+        let mut completed_count = 0;
+        let mut last_progress_time = std::time::Instant::now();
+
+        // 策略：按顺序下载每个需要的 piece
+        for piece_index in 0..piece_count {
             // 检查是否已完成
-            if let Some(state) = piece_manager.piece_state(i).await {
-                if state == crate::torrent::piece::PieceState::Completed {
+            if let Some(state) = piece_manager.piece_state(piece_index).await {
+                if state == PieceState::Completed {
+                    completed_count += 1;
                     continue;
                 }
             }
 
-            // 请求 piece（分块请求）
-            let piece_size = /* 获取 piece 大小 */ 256 * 1024;
-            let block_size = 16 * 1024;
-            let mut offset = 0;
+            // 检查 peer 是否有这个 piece
+            if !peer_pieces.contains(&piece_index) {
+                tracing::warn!("Peer 没有 piece {}", piece_index);
+                continue;
+            }
 
-            while offset < piece_size {
-                let request_size = std::cmp::min(block_size, piece_size - offset);
+            // 计算 piece 大小
+            let piece_size = if piece_index + 1 < piece_count {
+                piece_length as usize
+            } else {
+                // 最后一个 piece
+                let offset = (piece_index as u64) * (piece_length as u64);
+                (total_size - offset) as usize
+            };
+
+            tracing::info!("开始下载 piece {} (大小: {} bytes)", piece_index, piece_size);
+            piece_manager.mark_piece_downloading(piece_index).await;
+
+            // 分块下载
+            let mut piece_data = vec![0u8; piece_size];
+            let mut downloaded = 0;
+
+            while downloaded < piece_size {
+                let request_size = std::cmp::min(block_size, piece_size - downloaded);
 
                 // 发送请求
-                peer.request_piece(i as u32, offset as u32, request_size as u32).await?;
+                peer.request_piece(
+                    piece_index as u32,
+                    downloaded as u32,
+                    request_size as u32,
+                ).await?;
 
-                // 等待响应（简化，实际应该有超时和重试）
-                match timeout(Duration::from_secs(30), Self::receive_piece(peer)).await {
-                    Ok(Ok(Some((index, begin, data)))) => {
-                        if index == i as u32 && begin == offset as u32 {
-                            // 存储到 piece manager
-                            // piece_manager.add_block(...);
+                // 等待响应
+                match timeout(Duration::from_secs(30), peer.recv()).await {
+                    Ok(Ok(Message::Piece { index, begin, block })) => {
+                        if index as usize == piece_index && begin as usize == downloaded {
+                            // 复制数据
+                            let start = downloaded;
+                            let end = downloaded + block.len();
+                            if end <= piece_size {
+                                piece_data[start..end].copy_from_slice(&block);
+                                downloaded += block.len();
 
-                            offset += data.len();
+                                // 发送进度更新
+                                let percent = ((completed_count as f64) / (piece_count as f64)) * 100.0;
+                                if last_progress_time.elapsed() >= Duration::from_millis(500) {
+                                    let _ = event_tx.send(DownloadEvent::Progress {
+                                        percent: ((completed_count as f64 + (downloaded as f64) / (piece_size as f64)) / (piece_count as f64)) * 100.0,
+                                    }).await;
+                                    last_progress_time = std::time::Instant::now();
+                                }
+                            } else {
+                                tracing::warn!("Piece 数据越界");
+                            }
+                        } else {
+                            tracing::warn!("收到的 piece 数据不匹配");
                         }
                     }
-                    _ => {
-                        return Err(crate::common::error::Error::Timeout);
+                    Ok(Ok(msg)) => {
+                        tracing::debug!("收到其他消息: {:?}", std::mem::discriminant(&msg));
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        tracing::warn!("请求超时，重试...");
+                        // 重试
+                        continue;
                     }
                 }
             }
 
             // 校验并存储 piece
-            // let piece_data = piece_manager.get_piece_data(i).await;
-            // piece_manager.store_piece(i, &piece_data).await?;
+            tracing::info!("Piece {} 下载完成，正在校验...", piece_index);
 
-            // 发送完成事件
-            let _ = event_tx.send(DownloadEvent::PieceCompleted { index: i }).await;
+            match piece_manager.store_piece(piece_index, &piece_data).await {
+                Ok(_) => {
+                    tracing::info!("Piece {} 校验通过并已存储", piece_index);
+                    completed_count += 1;
 
-            // 发送进度
-            let completed = piece_manager.completed_count().await;
-            let total = piece_count;
-            let _ = event_tx.send(DownloadEvent::Progress { completed, total }).await;
+                    let _ = event_tx.send(DownloadEvent::PieceCompleted {
+                        index: piece_index,
+                    }).await;
 
-            if completed == total {
-                let _ = event_tx.send(DownloadEvent::DownloadComplete).await;
+                    // 发送进度更新
+                    let percent = ((completed_count as f64) / (piece_count as f64)) * 100.0;
+                    let _ = event_tx.send(DownloadEvent::Progress { percent }).await;
+                }
+                Err(e) => {
+                    tracing::error!("Piece {} 校验失败: {}", piece_index, e);
+                    return Err(Error::Other(format!("Piece {} 校验失败: {}", piece_index, e)));
+                }
+            }
+
+            // 发送 have 消息
+            peer.send_have(piece_index).await?;
+
+            // 检查是否全部完成
+            if completed_count == piece_count {
+                tracing::info!("所有 pieces 下载完成!");
                 break;
             }
         }
 
         Ok(())
-    }
-
-    /// 接收 piece 数据
-    async fn receive_piece(peer: &mut PeerConnection) -> Result<Option<(u32, u32, Vec<u8>)>> {
-        // 这里应该从 peer 的读取通道获取消息
-        // 简化实现
-        Ok(None)
     }
 
     /// 生成 peer ID

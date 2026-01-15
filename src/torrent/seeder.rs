@@ -170,7 +170,7 @@ impl Seeder {
             }
 
             // 解析消息
-            match Message::from_bytes(&message_bytes) {
+            match Message::from_bytes(&length_bytes, &message_bytes) {
                 Ok(message) => {
                     // 处理消息并发送响应
                     if let Err(e) = Self::handle_peer_message(

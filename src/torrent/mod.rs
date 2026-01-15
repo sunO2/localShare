@@ -9,11 +9,13 @@ pub mod protocol;
 pub mod peer;
 pub mod seeder;
 pub mod downloader;
+pub mod metadata;
 
 pub use metainfo::{TorrentMetaInfo, TorrentFile, FileInfo};
 pub use piece::{PieceManager, PieceState, Piece};
 pub use seeder::Seeder;
 pub use downloader::Downloader;
+pub use metadata::MetadataServer;
 
 /// 默认 Piece 大小 (256KB)
 /// 局域网环境可以使用更大的 piece 以提高效率
