@@ -127,6 +127,8 @@ pub struct App {
     next_task_id: usize,
     /// 共享文件列表 (名称 -> info_hash)
     shared_files: HashMap<String, String>,
+    /// 是否需要广播共享文件
+    need_broadcast: bool,
     /// 当前查看的设备
     viewing_device: Option<DeviceInfo>,
     /// 当前设备的共享文件列表
@@ -166,6 +168,7 @@ impl App {
             transfer_rx: Some(transfer_rx),
             next_task_id: 0,
             shared_files: HashMap::new(),
+            need_broadcast: false,
             viewing_device: None,
             device_shared_files: Vec::new(),
             shared_file_selected: 0,
@@ -596,6 +599,9 @@ impl App {
 
                             // 添加到共享文件列表
                             self.shared_files.insert(task.name.clone(), info_hash);
+
+                            // 标记需要广播
+                            self.need_broadcast = true;
                         }
                     }
                     TransferEvent::ShareFailed { id, reason } => {
@@ -1185,6 +1191,12 @@ async fn run_app(
 
         // 处理传输事件
         app.handle_transfer_events();
+
+        // 检查是否需要广播共享文件
+        if app.need_broadcast {
+            app.broadcast_shared_files().await;
+            app.need_broadcast = false;
+        }
 
         // 绘制 UI
         terminal.draw(|f| app.draw(f))?;
