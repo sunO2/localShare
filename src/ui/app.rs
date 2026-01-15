@@ -728,11 +728,18 @@ impl App {
                         tracing::info!("下载开始: id={}, name={}", id, name);
                         if let Some(task) = self.transfers.iter_mut().find(|t| t.id == id) {
                             task.status = TransferStatus::Downloading { progress: 0.0 };
+                            tracing::info!("✓ 任务 {} 状态已更新为下载中 (0%)", id);
+                        } else {
+                            tracing::warn!("✗ 未找到任务 ID {}", id);
                         }
                     }
                     TransferEvent::DownloadProgress { id, progress } => {
+                        tracing::debug!("下载进度: id={}, progress={:.1}%", id, progress * 100.0);
                         if let Some(task) = self.transfers.iter_mut().find(|t| t.id == id) {
                             task.status = TransferStatus::Downloading { progress };
+                            tracing::debug!("✓ 任务 {} 进度已更新", id);
+                        } else {
+                            tracing::warn!("✗ 未找到任务 ID {} 更新进度", id);
                         }
                     }
                     TransferEvent::DownloadCompleted { id } => {
@@ -1276,6 +1283,7 @@ async fn transfer_service_handler(
                 // 启动下载任务
                 let tx_clone = tx.clone();
                 let handle = tokio::spawn(async move {
+                    tracing::info!("=== 下载任务开始 ===");
                     // 简化的下载模拟
                     // TODO: 实现真正的 BitTorrent 下载逻辑
                     let total_pieces = 100;
@@ -1284,15 +1292,15 @@ async fn transfer_service_handler(
                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
                         let progress = (piece + 1) as f64 / total_pieces as f64;
+                        tracing::info!("发送进度更新: id={}, progress={:.1}%", id, progress * 100.0);
                         let _ = tx_clone.send(TransferEvent::DownloadProgress {
                             id,
                             progress,
                         });
-
-                        tracing::debug!("下载进度: {} - {:.1}%", name, progress * 100.0);
                     }
 
                     // 下载完成
+                    tracing::info!("发送下载完成事件: id={}", id);
                     let _ = tx_clone.send(TransferEvent::DownloadCompleted { id });
                     tracing::info!("下载完成: id={}, name={}", id, name);
                 });
