@@ -565,7 +565,11 @@ impl App {
                 self.device_shared_files.clear();
             }
             KeyCode::Tab | KeyCode::BackTab => {
-                // 切换焦点
+                // 切换焦点到传输列表
+                self.focus = Focus::TransferList;
+            }
+            KeyCode::Char('t') => {
+                // 切换到传输列表
                 self.focus = Focus::TransferList;
             }
             KeyCode::Char('q') => {
@@ -1097,7 +1101,7 @@ impl App {
         let help_text = Paragraph::new(vec![
             Line::from(vec![
                 Span::styled(
-                    " ↑/k:上 ↓/j:下 Enter/d:下载 Esc/h:返回 Tab:传输 t:返回 q:退出",
+                    " ↑/k:上 ↓/j:下 Enter/d:下载 Esc/h:返回 Tab/t:传输 q:退出",
                     Style::default().fg(Color::DarkGray),
                 ),
             ]),
