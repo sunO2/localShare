@@ -17,6 +17,9 @@ pub struct ServiceHandle {
 
     /// 关闭信号发送器
     shutdown_tx: Option<oneshot::Sender<()>>,
+
+    /// 后台任务句柄
+    task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ServiceHandle {
@@ -34,12 +37,19 @@ impl ServiceHandle {
 
     /// 注销服务
     pub async fn unregister(mut self) -> Result<()> {
-        // TODO: 发送 mDNS 注销消息
         tracing::info!("Unregistering service: {}", self.service_name);
 
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+
+        // 终止后台任务
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
+
+        // 等待任务清理
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         Ok(())
     }
@@ -63,13 +73,14 @@ pub fn register_service(config: ServiceConfig) -> Result<ServiceHandle> {
     tracing::info!("Registering service: {} on port {}", service_name, port);
 
     // 启动 mDNS 广播任务
-    tokio::spawn(async move {
+    let task_handle = tokio::spawn(async move {
         run_registration(config, shutdown_rx).await;
     });
 
     Ok(ServiceHandle {
         service_name,
         shutdown_tx: Some(shutdown_tx),
+        task_handle: Some(task_handle),
     })
 }
 

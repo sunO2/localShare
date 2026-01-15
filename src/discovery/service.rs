@@ -34,6 +34,9 @@ pub struct DiscoveryHandle {
 
     /// 关闭信号发送器
     shutdown_tx: Option<oneshot::Sender<()>>,
+
+    /// 后台任务句柄
+    task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DiscoveryHandle {
@@ -46,6 +49,7 @@ impl DiscoveryHandle {
     pub fn split(self) -> (mpsc::Receiver<DiscoveryEvent>, ShutdownHandle) {
         let shutdown = ShutdownHandle {
             shutdown_tx: self.shutdown_tx,
+            task_handle: self.task_handle,
         };
         (self.event_rx, shutdown)
     }
@@ -53,8 +57,14 @@ impl DiscoveryHandle {
     /// 关闭发现服务
     pub async fn shutdown(mut self) -> Result<()> {
         if let Some(tx) = self.shutdown_tx.take() {
-            tx.send(()).map_err(|_| Error::Other("Failed to send shutdown signal".to_string()))?;
+            let _ = tx.send(());
         }
+        // 终止后台任务
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
+        // 等待一小段时间让任务清理
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         Ok(())
     }
 }
@@ -63,14 +73,19 @@ impl DiscoveryHandle {
 #[derive(Debug)]
 pub struct ShutdownHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ShutdownHandle {
     /// 关闭发现服务
     pub async fn shutdown(mut self) -> Result<()> {
         if let Some(tx) = self.shutdown_tx.take() {
-            tx.send(()).map_err(|_| Error::Other("Failed to send shutdown signal".to_string()))?;
+            let _ = tx.send(());
         }
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         Ok(())
     }
 }
@@ -150,13 +165,14 @@ pub fn discovery_service(config: DiscoveryConfig) -> Result<DiscoveryHandle> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     // 启动 mDNS 监听任务
-    tokio::spawn(async move {
+    let task_handle = tokio::spawn(async move {
         run_discovery(config, event_tx, shutdown_rx).await;
     });
 
     Ok(DiscoveryHandle {
         event_rx,
         shutdown_tx: Some(shutdown_tx),
+        task_handle: Some(task_handle),
     })
 }
 

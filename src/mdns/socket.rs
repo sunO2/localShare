@@ -202,7 +202,7 @@ impl MdnsSocket {
 
     /// 发送到 IPv6 组播地址
     pub fn send_to_v6(&self, data: &[u8]) -> Result<usize> {
-        let addr: SocketAddr = format!("{}:{}", MDNS_IPV6, MDNS_PORT).parse().unwrap();
+        let addr: SocketAddr = format!("[{}]:{}", MDNS_IPV6, MDNS_PORT).parse().unwrap();
         match self.send_to(data, &addr) {
             Ok(n) => Ok(n),
             Err(e) => {
