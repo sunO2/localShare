@@ -123,6 +123,8 @@ pub struct App {
     transfer_tx: mpsc::Sender<TransferEvent>,
     /// 传输事件接收器
     transfer_rx: Option<mpsc::Receiver<TransferEvent>>,
+    /// 共享文件信息接收器 (文件名, info_hash)
+    shared_files_rx: Option<mpsc::Receiver<(String, String)>>,
     /// 下一个任务 ID
     next_task_id: usize,
     /// 共享文件列表 (名称 -> info_hash)
@@ -173,6 +175,7 @@ impl App {
             piece_managers: HashMap::new(),
             transfer_tx,
             transfer_rx: Some(transfer_rx),
+            shared_files_rx: None,
             next_task_id: 0,
             shared_files: HashMap::new(),
             need_broadcast: false,
@@ -346,6 +349,26 @@ impl App {
                 last_seen: std::time::Instant::now(),
             };
             self.devices.insert(0, local_device);
+        }
+    }
+
+    /// 处理共享文件信息接收
+    pub fn handle_shared_files_updates(&mut self) {
+        if let Some(rx) = &mut self.shared_files_rx {
+            while let Ok((file_name, info_hash)) = rx.try_recv() {
+                tracing::info!("=== 收到共享文件更新 ===");
+                tracing::info!("文件名: {}", file_name);
+                tracing::info!("Info Hash: {}", info_hash);
+
+                // 添加到共享文件列表
+                self.shared_files.insert(file_name.clone(), info_hash.clone());
+                tracing::info!("✓ 已添加到 shared_files");
+                tracing::info!("当前共享文件总数: {}", self.shared_files.len());
+
+                // 标记需要广播
+                self.need_broadcast = true;
+                tracing::info!("✓ 已设置 need_broadcast = true");
+            }
         }
     }
 
@@ -1116,9 +1139,16 @@ pub async fn run_tui() -> Result<()> {
     // 获取传输事件接收器和发送器，并启动传输服务
     let transfer_rx = app.transfer_rx.take().unwrap();
     let transfer_tx = app.transfer_tx();
+
+    // 创建共享文件信息通道
+    let (shared_files_tx, shared_files_rx) = mpsc::channel::<(String, String)>(100);
+
     let transfer_service = tokio::spawn(async move {
-        transfer_service_handler(transfer_rx, transfer_tx).await;
+        transfer_service_handler(transfer_rx, transfer_tx, shared_files_tx).await;
     });
+
+    // 将 shared_files_rx 放回 App
+    app.shared_files_rx = Some(shared_files_rx);
 
     // 运行主循环
     let result = run_app(&mut terminal, &mut app).await;
@@ -1139,7 +1169,11 @@ pub async fn run_tui() -> Result<()> {
 }
 
 /// 传输服务处理器 - 在后台处理所有文件传输任务
-async fn transfer_service_handler(mut rx: mpsc::Receiver<TransferEvent>, tx: mpsc::Sender<TransferEvent>) {
+async fn transfer_service_handler(
+    mut rx: mpsc::Receiver<TransferEvent>,
+    tx: mpsc::Sender<TransferEvent>,
+    shared_files_tx: mpsc::Sender<(String, String)>, // (文件名, info_hash)
+) {
     let mut pending_shares: HashMap<usize, PathBuf> = HashMap::new();
     let mut active_seeders: HashMap<PathBuf, (Arc<TorrentFile>, tokio::task::JoinHandle<()>)> = HashMap::new();
     let mut active_downloads: HashMap<usize, tokio::task::JoinHandle<()>> = HashMap::new();
@@ -1202,6 +1236,10 @@ async fn transfer_service_handler(mut rx: mpsc::Receiver<TransferEvent>, tx: mps
 
                         tracing::info!("共享完成: id={}, file={}, hash={}", id, file_name, info_hash);
                         tracing::info!("✓ 发送 ShareCompleted 事件");
+
+                        // 发送共享文件信息到主线程
+                        let _ = shared_files_tx.send((file_name.clone(), info_hash.clone())).await;
+                        tracing::info!("✓ 已将共享文件信息发送到主线程: {} -> {}", file_name, info_hash);
                     }
                     Err(e) => {
                         tracing::error!("✗ TorrentFile 创建失败: {}", e);
@@ -1273,6 +1311,9 @@ async fn run_app(
 
         // 处理传输事件
         app.handle_transfer_events();
+
+        // 处理共享文件信息更新
+        app.handle_shared_files_updates();
 
         // 检查是否需要广播共享文件
         if app.need_broadcast {
