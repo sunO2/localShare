@@ -629,10 +629,16 @@ impl App {
 
     /// 开始下载共享文件
     fn start_download(&mut self, shared_file: &SharedFile) {
+        tracing::info!("=== 用户请求下载文件 ===");
+        tracing::info!("文件名: {}", shared_file.name);
+        tracing::info!("Info Hash: {}", shared_file.info_hash);
+
         // 获取设备信息
         let device_name = self.viewing_device.as_ref()
             .map(|d| d.name.clone())
             .unwrap_or_else(|| "未知设备".to_string());
+
+        tracing::info!("来源设备: {}", device_name);
 
         // 获取设备地址和端口
         let device_addr = self.viewing_device.as_ref()
@@ -640,14 +646,18 @@ impl App {
             .or_else(|| self.viewing_device.as_ref().and_then(|d| d.get_address(true)))
             .cloned()
             .unwrap_or_else(|| {
+                tracing::warn!("无法获取设备地址，使用默认地址");
                 let port = self.viewing_device.as_ref()
                     .and_then(|d| d.get_bt_port())
                     .unwrap_or(6881);
-                SocketAddr::from(([0, 0, 0, 0], port))
+                SocketAddr::from(([127, 0, 0, 1], port))
             });
+
+        tracing::info!("设备地址: {}", device_addr);
 
         // 分配任务 ID
         let task_id = self.allocate_task_id();
+        tracing::info!("分配任务 ID: {}", task_id);
 
         // 创建传输任务
         let task = TransferTask {
@@ -661,14 +671,17 @@ impl App {
         self.transfers.push(task);
 
         // 发送下载开始事件
-        let _ = self.transfer_tx.try_send(TransferEvent::DownloadStarted {
+        match self.transfer_tx.try_send(TransferEvent::DownloadStarted {
             id: task_id,
             name: shared_file.name.clone(),
             device_addr,
             info_hash: shared_file.info_hash.clone(),
-        });
+        }) {
+            Ok(_) => tracing::info!("✓ DownloadStarted 事件已发送"),
+            Err(e) => tracing::error!("✗ 发送 DownloadStarted 事件失败: {}", e),
+        }
 
-        tracing::info!("开始下载: {} from {}", shared_file.name, device_name);
+        tracing::info!("下载任务已创建: {} from {}", shared_file.name, device_name);
     }
 
     /// 处理传输事件
