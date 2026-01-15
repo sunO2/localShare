@@ -7,6 +7,9 @@ pub mod common;
 pub mod discovery;
 pub mod mdns;
 
+// BitTorrent 传输模块
+pub mod torrent;
+
 // 重新导出常用类型
 pub use common::error::{Error, Result};
 pub use common::config::{DiscoveryConfig, ServiceConfig};
