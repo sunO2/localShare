@@ -1,9 +1,10 @@
 //! TUI 应用程序
 
 use super::file_browser::FileBrowser;
-use sharSelf::discovery::{discovery_service, DiscoveryEvent, DeviceInfo};
-use sharSelf::common::config::DiscoveryConfig;
+use sharSelf::discovery::{discovery_service, register_service, DiscoveryEvent, DeviceInfo};
+use sharSelf::common::config::{DiscoveryConfig, ServiceConfig};
 use sharSelf::common::error::Result;
+use std::collections::HashMap;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent},
     execute,
@@ -45,6 +46,8 @@ pub struct App {
     event_rx: Option<mpsc::Receiver<DiscoveryEvent>>,
     /// 发现服务句柄
     _discovery_handle: Option<sharSelf::discovery::service::ShutdownHandle>,
+    /// 服务注册句柄
+    _service_handle: Option<sharSelf::discovery::registrar::ServiceHandle>,
 }
 
 impl App {
@@ -58,13 +61,44 @@ impl App {
             running: true,
             event_rx: None,
             _discovery_handle: None,
+            _service_handle: None,
         }
     }
 
-    /// 启动设备发现
+    /// 启动设备发现和服务注册
     pub async fn start_discovery(&mut self) -> Result<()> {
+        // 1. 注册自己的服务
+        let hostname = gethostname::gethostname()
+            .into_string()
+            .unwrap_or_else(|_| "Unknown".to_string());
+
+        let mut txt_records = HashMap::new();
+        txt_records.insert("version".to_string(), "0.1.0".to_string());
+        txt_records.insert("platform".to_string(), Self::get_platform().to_string());
+
+        let service_config = ServiceConfig {
+            service_name: hostname.clone(),
+            service_type: sharSelf::DEFAULT_SERVICE_TYPE.to_string(),
+            port: 8080,
+            txt_records,
+            hostname: Some(hostname),
+            ttl: 120,
+            ..Default::default()
+        };
+
+        match register_service(service_config) {
+            Ok(service) => {
+                tracing::info!("Registered as mDNS service");
+                self._service_handle = Some(service);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to register service: {}, continuing with discovery only", e);
+            }
+        }
+
+        // 2. 启动设备发现
         let config = DiscoveryConfig::default();
-        let mut discovery = discovery_service(config)?;
+        let discovery = discovery_service(config)?;
 
         // 分离事件接收器和关闭句柄
         let (event_rx, shutdown_handle) = discovery.split();
@@ -72,6 +106,31 @@ impl App {
         self._discovery_handle = Some(shutdown_handle);
 
         Ok(())
+    }
+
+    /// 获取平台信息
+    fn get_platform() -> &'static str {
+        #[cfg(target_os = "android")]
+        return "Android";
+        #[cfg(target_os = "ios")]
+        return "iOS";
+        #[cfg(target_os = "linux")]
+        return "Linux";
+        #[cfg(target_os = "macos")]
+        return "macOS";
+        #[cfg(target_os = "windows")]
+        return "Windows";
+        #[cfg(target_os = "freebsd")]
+        return "FreeBSD";
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "freebsd"
+        )))]
+        return "Unknown";
     }
 
     /// 处理设备发现事件
