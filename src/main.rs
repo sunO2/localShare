@@ -14,10 +14,8 @@ use tokio::time::{timeout, Duration};
 
 #[tokio::main]
 async fn main() -> sharSelf::Result<()> {
-    // 初始化日志
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    // 不在这里初始化日志，让各个模式自己初始化
+    // run_tui() 会将日志写入文件，其他模式使用默认输出
 
     println!("🔍 sharSelf 设备发现演示");
     println!("========================================\n");
@@ -95,6 +93,11 @@ async fn run_tui() -> sharSelf::Result<()> {
 
 /// 仅注册服务
 async fn run_registrar_only(hostname: String) -> sharSelf::Result<()> {
+    // 初始化日志到控制台
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
+
     println!("\n📡 模式: 仅注册服务");
     println!("----------------------------------------\n");
 
