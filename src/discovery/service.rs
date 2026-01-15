@@ -348,7 +348,7 @@ fn find_device_info(
         .chain(packet.additionals.iter())
         .find(|r| r.rtype == RecordType::SRV && r.name == service_full_name)?;
 
-    let (priority, weight, port, target) = if let RecordData::Srv { priority, weight, port, target } = &srv_record.data {
+    let (_priority, weight, port, target) = if let RecordData::Srv { priority, weight, port, target } = &srv_record.data {
         (*priority, *weight, *port, target.clone())
     } else {
         return None;

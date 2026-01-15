@@ -72,12 +72,6 @@ impl MdnsSocket {
         // 设置 SO_REUSEADDR
         socket.set_reuse_address(true)?;
 
-        // SO_REUSEPORT 在某些平台可能不可用
-        #[cfg(all(unix, not(target_os = "android")))]
-        {
-            let _ = socket.set_reuse_port(true);
-        }
-
         // 尝试绑定到 mDNS 端口 (5353)
         // 在 Android/Termux 上可能需要特殊权限，如果失败则绑定到随机端口
         let bind_result = socket.bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT)));
@@ -119,12 +113,6 @@ impl MdnsSocket {
 
         // 设置 SO_REUSEADDR
         socket.set_reuse_address(true)?;
-
-        // SO_REUSEPORT 在某些平台可能不可用
-        #[cfg(all(unix, not(target_os = "android")))]
-        {
-            let _ = socket.set_reuse_port(true);
-        }
 
         // 尝试绑定到 mDNS 端口 (5353)
         let addr = std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0);

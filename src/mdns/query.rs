@@ -110,7 +110,6 @@ impl MdnsQuery {
 
         // 等待响应 - 使用简单的轮询方式
         let start = std::time::Instant::now();
-        let mut buffer = vec![0u8; 4096];
 
         loop {
             let elapsed = start.elapsed();
