@@ -129,6 +129,8 @@ pub struct App {
     shared_files: HashMap<String, String>,
     /// 是否需要广播共享文件
     need_broadcast: bool,
+    /// 本机主机名
+    local_hostname: String,
     /// 当前查看的设备
     viewing_device: Option<DeviceInfo>,
     /// 当前设备的共享文件列表
@@ -140,6 +142,11 @@ pub struct App {
 impl App {
     /// 创建新的 TUI 应用
     pub fn new(start_dir: PathBuf) -> Self {
+        // 获取本机主机名
+        let local_hostname = gethostname::gethostname()
+            .into_string()
+            .unwrap_or_else(|_| "Unknown".to_string());
+
         // 获取本机 IP 地址
         let local_ip = Self::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
         let local_addr = format!("{}:{}", local_ip, DEFAULT_BT_PORT)
@@ -169,6 +176,7 @@ impl App {
             next_task_id: 0,
             shared_files: HashMap::new(),
             need_broadcast: false,
+            local_hostname,
             viewing_device: None,
             device_shared_files: Vec::new(),
             shared_file_selected: 0,
@@ -242,8 +250,11 @@ impl App {
     /// 广播共享文件信息到 mDNS
     pub async fn broadcast_shared_files(&mut self) {
         if self.shared_files.is_empty() {
+            tracing::debug!("No shared files to broadcast");
             return;
         }
+
+        tracing::info!("Attempting to broadcast {} shared files", self.shared_files.len());
 
         if let Some(service) = &mut self.service_handle {
             // 构建新的 TXT 记录，包含共享文件信息
@@ -254,14 +265,17 @@ impl App {
             // 添加共享文件列表
             for (name, hash) in &self.shared_files {
                 txt_records.insert(format!("file_{}", name), hash.clone());
+                tracing::info!("Broadcasting file: {} -> {}", name, hash);
             }
 
             // 更新 mDNS TXT 记录
             if let Err(e) = service.update_txt(txt_records).await {
                 tracing::warn!("Failed to update mDNS TXT records: {}", e);
             } else {
-                tracing::info!("Broadcasted {} shared files via mDNS", self.shared_files.len());
+                tracing::info!("Successfully broadcasted {} shared files via mDNS", self.shared_files.len());
             }
+        } else {
+            tracing::warn!("No service handle available, cannot broadcast shared files");
         }
     }
 
@@ -296,19 +310,42 @@ impl App {
             while let Ok(event) = rx.try_recv() {
                 match event {
                     DiscoveryEvent::DeviceFound(device) => {
-                        self.devices.push(device);
+                        // 不添加自己的设备（我们会单独添加）
+                        if device.name != self.local_hostname {
+                            self.devices.push(device);
+                        }
                     }
                     DiscoveryEvent::DeviceLost(name) => {
                         self.devices.retain(|d| d.name != name);
                     }
                     DiscoveryEvent::DeviceUpdated(device) => {
-                        if let Some(pos) = self.devices.iter().position(|d| d.name == device.name) {
-                            self.devices[pos] = device;
+                        if device.name != self.local_hostname {
+                            if let Some(pos) = self.devices.iter().position(|d| d.name == device.name) {
+                                self.devices[pos] = device;
+                            }
                         }
                     }
                     DiscoveryEvent::Error(_) => {}
                 }
             }
+        }
+
+        // 确保本机设备始终在列表中（放在第一位）
+        let has_self = self.devices.iter().any(|d| d.name == self.local_hostname);
+        if !has_self {
+            // 创建一个虚拟的本机设备
+            let local_device = DeviceInfo {
+                name: self.local_hostname.clone(),
+                hostname: self.local_hostname.clone(),
+                addresses: Vec::new(), // 本地设备不需要地址
+                port: 8080,
+                txt_records: self.shared_files.iter()
+                    .map(|(name, hash)| (format!("file_{}", name), hash.clone()))
+                    .collect(),
+                service_type: sharSelf::DEFAULT_SERVICE_TYPE.to_string(),
+                last_seen: std::time::Instant::now(),
+            };
+            self.devices.insert(0, local_device);
         }
     }
 
@@ -349,7 +386,21 @@ impl App {
                 // 查看设备共享的文件
                 if let Some(device) = self.devices.get(self.device_selected) {
                     self.viewing_device = Some(device.clone());
-                    self.device_shared_files = device.get_shared_files();
+
+                    // 如果是自己的设备，直接使用内部共享文件列表
+                    if device.name == self.local_hostname {
+                        self.device_shared_files = self.shared_files.iter()
+                            .map(|(name, hash)| SharedFile {
+                                name: name.clone(),
+                                info_hash: hash.clone(),
+                                size: None,
+                            })
+                            .collect();
+                        tracing::info!("Viewing own shared files: {} files", self.device_shared_files.len());
+                    } else {
+                        self.device_shared_files = device.get_shared_files();
+                    }
+
                     self.shared_file_selected = 0;
                     self.focus = Focus::SharedFiles;
                 }
