@@ -18,7 +18,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
-use std::{io, path::PathBuf, time::Duration};
+use std::{io, path::PathBuf, time::Duration, collections::HashSet};
 use tokio::sync::mpsc;
 
 /// 应用焦点
@@ -36,6 +36,8 @@ pub struct App {
     devices: Vec<DeviceInfo>,
     /// 设备列表选中索引
     device_selected: usize,
+    /// 选中的设备名称集合
+    selected_devices: HashSet<String>,
     /// 文件浏览器
     file_browser: FileBrowser,
     /// 当前焦点
@@ -56,6 +58,7 @@ impl App {
         App {
             devices: Vec::new(),
             device_selected: 0,
+            selected_devices: HashSet::new(),
             file_browser: FileBrowser::new(start_dir),
             focus: Focus::DeviceList,
             running: true,
@@ -176,6 +179,16 @@ impl App {
                     self.device_selected += 1;
                 }
             }
+            KeyCode::Char(' ') => {
+                // 空格键切换选择状态
+                if let Some(device) = self.devices.get(self.device_selected) {
+                    if self.selected_devices.contains(&device.name) {
+                        self.selected_devices.remove(&device.name);
+                    } else {
+                        self.selected_devices.insert(device.name.clone());
+                    }
+                }
+            }
             KeyCode::Enter => {
                 // 选择设备，切换焦点到文件浏览器
                 self.focus = Focus::FileBrowser;
@@ -183,6 +196,16 @@ impl App {
             KeyCode::Tab | KeyCode::BackTab => {
                 // 切换焦点
                 self.focus = Focus::FileBrowser;
+            }
+            KeyCode::Char('a') => {
+                // 全选/取消全选
+                if self.selected_devices.len() == self.devices.len() {
+                    self.selected_devices.clear();
+                } else {
+                    for device in &self.devices {
+                        self.selected_devices.insert(device.name.clone());
+                    }
+                }
             }
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.running = false;
@@ -251,8 +274,12 @@ impl App {
         let title = Line::from(vec![
             Span::raw(" 设备列表 "),
             Span::styled(
-                format!("({})", self.devices.len()),
+                format!("({}/{})", self.selected_devices.len(), self.devices.len()),
                 Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                if self.focus == Focus::DeviceList { "[聚焦]" } else { "" },
+                Style::default().fg(Color::Cyan),
             ),
         ]);
 
@@ -261,22 +288,31 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, device)| {
-                let is_selected = i == self.device_selected && self.focus == Focus::DeviceList;
-                let style = if is_selected {
+                let is_cursor_selected = i == self.device_selected && self.focus == Focus::DeviceList;
+                let is_checked = self.selected_devices.contains(&device.name);
+
+                let style = if is_cursor_selected {
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
+                } else if is_checked {
+                    Style::default()
+                        .fg(Color::Green)
                 } else {
                     Style::default()
                 };
 
+                // 选择标记
+                let check_mark = if is_checked { "[✓] " } else { "[ ] " };
+
                 let content = vec![
                     Line::from(vec![
+                        Span::styled(check_mark, Style::default().fg(Color::Yellow)),
                         Span::styled(&device.name, style),
                     ]),
                     Line::from(vec![
                         Span::styled(
-                            format!("  📡 {}:{}",
+                            format!("    📡 {}:{}",
                                 device.addresses.first().map(|a: &std::net::SocketAddr| a.ip().to_string()).unwrap_or_else(|| "未知".to_string()),
                                 device.port
                             ),
@@ -311,6 +347,13 @@ impl App {
                 Style::default().fg(Color::Cyan),
             ),
         ]);
+
+        // 根据焦点显示不同的操作提示
+        let help_text = if self.focus == Focus::DeviceList {
+            " ↑/k:上 ↓/j:下 Space:选择 a:全选 Tab:切换 q:退出"
+        } else {
+            " ↑/k:上 ↓/j:下 Enter:进入 ←/h:返回 Tab:切换 q:退出"
+        };
 
         let items: Vec<ListItem> = self
             .file_browser
@@ -359,7 +402,7 @@ impl App {
             ]),
             Line::from(vec![
                 Span::styled(
-                    " ↑/k:上 ↓/j:下 Enter:进入 ←/h:返回 Tab:切换焦点 q:退出",
+                    help_text,
                     Style::default().fg(Color::DarkGray),
                 ),
             ]),
