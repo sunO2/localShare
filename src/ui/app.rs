@@ -1162,13 +1162,16 @@ pub async fn run_tui() -> Result<()> {
 
     // 获取传输事件接收器和发送器，并启动传输服务
     let transfer_rx = app.transfer_rx.take().unwrap();
-    let transfer_tx = app.transfer_tx();
+
+    // 创建一个从后台任务到主线程的事件通道
+    let (event_back_tx, event_back_rx) = mpsc::channel::<TransferEvent>(100);
+    app.transfer_rx = Some(event_back_rx);
 
     // 创建共享文件信息通道
     let (shared_files_tx, shared_files_rx) = mpsc::channel::<(String, String)>(100);
 
     let transfer_service = tokio::spawn(async move {
-        transfer_service_handler(transfer_rx, transfer_tx, shared_files_tx).await;
+        transfer_service_handler(transfer_rx, event_back_tx, shared_files_tx).await;
     });
 
     // 将 shared_files_rx 放回 App
@@ -1195,7 +1198,7 @@ pub async fn run_tui() -> Result<()> {
 /// 传输服务处理器 - 在后台处理所有文件传输任务
 async fn transfer_service_handler(
     mut rx: mpsc::Receiver<TransferEvent>,
-    tx: mpsc::Sender<TransferEvent>,
+    event_back_tx: mpsc::Sender<TransferEvent>, // 发送事件回主线程
     shared_files_tx: mpsc::Sender<(String, String)>, // (文件名, info_hash)
 ) {
     let mut pending_shares: HashMap<usize, PathBuf> = HashMap::new();
@@ -1252,14 +1255,14 @@ async fn transfer_service_handler(
 
                         active_seeders.insert(path.clone(), (Arc::new(torrent.clone()), seeder_handle));
 
-                        // 发送完成事件（克隆 info_hash）
-                        let _ = tx.send(TransferEvent::ShareCompleted {
+                        // 发送完成事件回主线程
+                        let _ = event_back_tx.send(TransferEvent::ShareCompleted {
                             id,
                             info_hash: info_hash.clone(),
                         });
 
                         tracing::info!("共享完成: id={}, file={}, hash={}", id, file_name, info_hash);
-                        tracing::info!("✓ 发送 ShareCompleted 事件");
+                        tracing::info!("✓ 发送 ShareCompleted 事件到主线程");
 
                         // 发送共享文件信息到主线程
                         let _ = shared_files_tx.send((file_name.clone(), info_hash.clone())).await;
@@ -1269,7 +1272,7 @@ async fn transfer_service_handler(
                         tracing::error!("✗ TorrentFile 创建失败: {}", e);
                         tracing::error!("共享失败: id={}, reason={}", id, e);
                         // 发送失败事件
-                        let _ = tx.send(TransferEvent::ShareFailed {
+                        let _ = event_back_tx.send(TransferEvent::ShareFailed {
                             id,
                             reason: e.to_string(),
                         });
@@ -1281,7 +1284,7 @@ async fn transfer_service_handler(
                     id, name, device_addr, info_hash);
 
                 // 启动下载任务
-                let tx_clone = tx.clone();
+                let tx_clone = event_back_tx.clone();
                 let handle = tokio::spawn(async move {
                     tracing::info!("=== 下载任务开始 ===");
                     // 简化的下载模拟
@@ -1308,7 +1311,7 @@ async fn transfer_service_handler(
                 active_downloads.insert(id, handle);
             }
             _ => {
-                // 其他事件已经在 App 中处理
+                // 其他事件忽略
             }
         }
     }
