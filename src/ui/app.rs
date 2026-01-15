@@ -389,6 +389,10 @@ impl App {
 
                     // 如果是自己的设备，直接使用内部共享文件列表
                     if device.name == self.local_hostname {
+                        tracing::info!("Viewing own device. Shared files count: {}", self.shared_files.len());
+                        for (name, hash) in &self.shared_files {
+                            tracing::info!("  - File: {}, Hash: {}", name, hash);
+                        }
                         self.device_shared_files = self.shared_files.iter()
                             .map(|(name, hash)| SharedFile {
                                 name: name.clone(),
@@ -396,7 +400,7 @@ impl App {
                                 size: None,
                             })
                             .collect();
-                        tracing::info!("Viewing own shared files: {} files", self.device_shared_files.len());
+                        tracing::info!("Loaded {} shared files for display", self.device_shared_files.len());
                     } else {
                         self.device_shared_files = device.get_shared_files();
                     }
@@ -649,7 +653,12 @@ impl App {
                             task.peer = format!("Hash: {}", &info_hash[..16]);
 
                             // 添加到共享文件列表
-                            self.shared_files.insert(task.name.clone(), info_hash);
+                            self.shared_files.insert(task.name.clone(), info_hash.clone());
+
+                            tracing::info!("=== 共享文件已添加到列表 ===");
+                            tracing::info!("文件名: {}", task.name);
+                            tracing::info!("Info Hash: {}", info_hash);
+                            tracing::info!("当前共享文件总数: {}", self.shared_files.len());
 
                             // 标记需要广播
                             self.need_broadcast = true;
