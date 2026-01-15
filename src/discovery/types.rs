@@ -58,6 +58,17 @@ pub struct DeviceInfo {
     pub last_seen: std::time::Instant,
 }
 
+/// 共享文件信息
+#[derive(Debug, Clone)]
+pub struct SharedFile {
+    /// 文件名
+    pub name: String,
+    /// Info Hash (20字节的十六进制字符串)
+    pub info_hash: String,
+    /// 文件大小（可选）
+    pub size: Option<u64>,
+}
+
 impl DeviceInfo {
     /// 创建新的设备信息
     pub fn new(
@@ -97,6 +108,31 @@ impl DeviceInfo {
     /// 检查是否过期
     pub fn is_expired(&self, ttl_secs: u64) -> bool {
         self.last_seen.elapsed().as_secs() > ttl_secs
+    }
+
+    /// 获取该设备共享的文件列表
+    pub fn get_shared_files(&self) -> Vec<SharedFile> {
+        let mut files = Vec::new();
+
+        // 从 TXT 记录中查找以 "file_" 开头的记录
+        for (key, value) in &self.txt_records {
+            if let Some(file_name) = key.strip_prefix("file_") {
+                files.push(SharedFile {
+                    name: file_name.to_string(),
+                    info_hash: value.clone(),
+                    size: None, // 大小信息暂时不可用
+                });
+            }
+        }
+
+        files
+    }
+
+    /// 获取 BitTorrent 端口（如果有）
+    pub fn get_bt_port(&self) -> Option<u16> {
+        // 检查是否有 BT 端口信息
+        self.txt_records.get("bt_port").and_then(|p| p.parse::<u16>().ok())
+            .or(Some(6881)) // 默认端口
     }
 }
 

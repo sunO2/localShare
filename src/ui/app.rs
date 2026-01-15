@@ -1,10 +1,10 @@
 //! TUI 应用程序
 
 use super::file_browser::FileBrowser;
-use sharSelf::discovery::{discovery_service, register_service, DiscoveryEvent, DeviceInfo};
+use sharSelf::discovery::{discovery_service, register_service, DiscoveryEvent, DeviceInfo, SharedFile};
 use sharSelf::common::config::{DiscoveryConfig, ServiceConfig};
 use sharSelf::common::error::Result;
-use sharSelf::torrent::{TorrentFile, PieceManager, Seeder, DEFAULT_BT_PORT};
+use sharSelf::torrent::{TorrentFile, PieceManager, Seeder, Downloader, DEFAULT_BT_PORT};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap, Gauge},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::{io, time::Duration};
@@ -34,6 +34,8 @@ pub enum Focus {
     FileBrowser,
     /// 传输列表
     TransferList,
+    /// 共享文件列表
+    SharedFiles,
 }
 
 /// 传输任务状态
@@ -125,6 +127,12 @@ pub struct App {
     next_task_id: usize,
     /// 共享文件列表 (名称 -> info_hash)
     shared_files: HashMap<String, String>,
+    /// 当前查看的设备
+    viewing_device: Option<DeviceInfo>,
+    /// 当前设备的共享文件列表
+    device_shared_files: Vec<SharedFile>,
+    /// 共享文件列表选中索引
+    shared_file_selected: usize,
 }
 
 impl App {
@@ -158,6 +166,9 @@ impl App {
             transfer_rx: Some(transfer_rx),
             next_task_id: 0,
             shared_files: HashMap::new(),
+            viewing_device: None,
+            device_shared_files: Vec::new(),
+            shared_file_selected: 0,
         }
     }
 
@@ -304,6 +315,7 @@ impl App {
             Focus::DeviceList => self.handle_device_list_keys(key),
             Focus::FileBrowser => self.handle_file_browser_keys(key),
             Focus::TransferList => self.handle_transfer_list_keys(key),
+            Focus::SharedFiles => self.handle_shared_files_keys(key),
         }
     }
 
@@ -331,8 +343,13 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                // 选择设备，切换焦点到文件浏览器
-                self.focus = Focus::FileBrowser;
+                // 查看设备共享的文件
+                if let Some(device) = self.devices.get(self.device_selected) {
+                    self.viewing_device = Some(device.clone());
+                    self.device_shared_files = device.get_shared_files();
+                    self.shared_file_selected = 0;
+                    self.focus = Focus::SharedFiles;
+                }
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 // 切换焦点
@@ -384,6 +401,7 @@ impl App {
                     Focus::DeviceList => Focus::FileBrowser,
                     Focus::FileBrowser => Focus::TransferList,
                     Focus::TransferList => Focus::DeviceList,
+                    Focus::SharedFiles => Focus::TransferList,
                 };
             }
             KeyCode::Char('s') => {
@@ -434,6 +452,48 @@ impl App {
         }
     }
 
+    /// 处理共享文件列表键盘事件
+    fn handle_shared_files_keys(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.shared_file_selected > 0 {
+                    self.shared_file_selected -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.shared_file_selected + 1 < self.device_shared_files.len() {
+                    self.shared_file_selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                // 开始下载选中的文件
+                if let Some(shared_file) = self.device_shared_files.get(self.shared_file_selected).cloned() {
+                    self.start_download(&shared_file);
+                }
+            }
+            KeyCode::Char('d') => {
+                // 开始下载选中的文件
+                if let Some(shared_file) = self.device_shared_files.get(self.shared_file_selected).cloned() {
+                    self.start_download(&shared_file);
+                }
+            }
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+                // 返回设备列表
+                self.focus = Focus::DeviceList;
+                self.viewing_device = None;
+                self.device_shared_files.clear();
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                // 切换焦点
+                self.focus = Focus::TransferList;
+            }
+            KeyCode::Char('q') => {
+                self.running = false;
+            }
+            _ => {}
+        }
+    }
+
     /// 启动共享选中的文件
     fn start_sharing_selected_file(&mut self) {
         // 先克隆需要的数据
@@ -470,6 +530,36 @@ impl App {
         });
 
         tracing::info!("准备共享文件: {:?}", item_path);
+    }
+
+    /// 开始下载共享文件
+    fn start_download(&mut self, shared_file: &SharedFile) {
+        // 获取设备信息
+        let device_name = self.viewing_device.as_ref()
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| "未知设备".to_string());
+
+        // 分配任务 ID
+        let task_id = self.allocate_task_id();
+
+        // 创建传输任务
+        let task = TransferTask {
+            name: shared_file.name.clone(),
+            peer: device_name.clone(),
+            size: shared_file.size.unwrap_or(0),
+            status: TransferStatus::Preparing,
+            is_upload: false,
+            id: task_id,
+        };
+        self.transfers.push(task);
+
+        // 发送下载开始事件
+        let _ = self.transfer_tx.try_send(TransferEvent::DownloadStarted {
+            id: task_id,
+            name: shared_file.name.clone(),
+        });
+
+        tracing::info!("开始下载: {} from {}", shared_file.name, device_name);
     }
 
     /// 处理传输事件
@@ -544,6 +634,10 @@ impl App {
             Focus::TransferList => {
                 // 传输列表全屏显示
                 self.draw_transfer_list(f, f.size());
+            }
+            Focus::SharedFiles => {
+                // 共享文件列表全屏显示
+                self.draw_shared_files(f, f.size());
             }
             _ => {
                 // 设备列表和文件浏览器
@@ -789,6 +883,91 @@ impl App {
             Line::from(vec![
                 Span::styled(
                     " ↑/k:上 ↓/j:下 d:删除 Tab:切换 t:返回 q:退出",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(" 操作提示 "))
+        .wrap(Wrap { trim: false });
+
+        f.render_widget(help_text, help_area);
+    }
+
+    /// 绘制共享文件列表
+    fn draw_shared_files(&self, f: &mut Frame, area: Rect) {
+        let device_name = self.viewing_device.as_ref()
+            .map(|d| d.name.as_str())
+            .unwrap_or("未知设备");
+
+        let title = Line::from(vec![
+            Span::raw(" 共享文件 "),
+            Span::styled(
+                format!("@ {} ({})", device_name, self.device_shared_files.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                if self.focus == Focus::SharedFiles { "[聚焦]" } else { "" },
+                Style::default().fg(Color::Cyan),
+            ),
+        ]);
+
+        let items: Vec<ListItem> = self
+            .device_shared_files
+            .iter()
+            .enumerate()
+            .map(|(i, file)| {
+                let is_selected = i == self.shared_file_selected && self.focus == Focus::SharedFiles;
+
+                let style = if is_selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+
+                // 文件图标
+                let icon = "📄";
+
+                let content = vec![
+                    Line::from(vec![
+                        Span::styled(icon, Style::default().fg(Color::Yellow)),
+                        Span::styled(" ", Style::default()),
+                        Span::styled(&file.name, style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            format!("    🔖 Hash: {}...", &file.info_hash[..16.min(file.info_hash.len())]),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]),
+                ];
+
+                ListItem::new(content)
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            );
+
+        f.render_widget(list, area);
+
+        // 绘制操作提示
+        let help_area = Rect {
+            y: area.y + area.height - 3,
+            height: 3,
+            ..area
+        };
+
+        let help_text = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    " ↑/k:上 ↓/j:下 Enter/d:下载 Esc/h:返回 Tab:传输 t:返回 q:退出",
                     Style::default().fg(Color::DarkGray),
                 ),
             ]),
