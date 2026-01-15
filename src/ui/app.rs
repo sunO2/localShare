@@ -554,21 +554,32 @@ impl App {
 
     /// 启动共享选中的文件
     fn start_sharing_selected_file(&mut self) {
+        tracing::info!("=== 用户按下了 's' 键，准备共享文件 ===");
+
         // 先克隆需要的数据
         let (item_name, item_size) = match self.file_browser.selected_file() {
-            Some(item) => (item.name.clone(), item.size),
-            None => return,
+            Some(item) => {
+                tracing::info!("选中的文件: {}, 大小: {}", item.name, item.size);
+                (item.name.clone(), item.size)
+            }
+            None => {
+                tracing::warn!("没有选中的文件！");
+                return;
+            }
         };
 
         let item_path = self.file_browser.current_dir().join(&item_name);
+        tracing::info!("完整路径: {:?}", item_path);
 
         // 检查是否已经在共享
         if self.seeders.contains_key(&item_path) {
+            tracing::warn!("文件已经在共享列表中: {:?}", item_path);
             return;
         }
 
         // 分配任务 ID
         let task_id = self.allocate_task_id();
+        tracing::info!("分配任务 ID: {}", task_id);
 
         // 创建传输任务
         let task = TransferTask {
@@ -582,10 +593,13 @@ impl App {
         self.transfers.push(task);
 
         // 发送共享开始事件（克隆 path 避免移动）
-        let _ = self.transfer_tx.try_send(TransferEvent::ShareStarted {
+        match self.transfer_tx.try_send(TransferEvent::ShareStarted {
             id: task_id,
             path: item_path.clone(),
-        });
+        }) {
+            Ok(_) => tracing::info!("✓ ShareStarted 事件已发送"),
+            Err(e) => tracing::error!("✗ 发送 ShareStarted 事件失败: {}", e),
+        }
 
         tracing::info!("准备共享文件: {:?}", item_path);
     }
@@ -1133,16 +1147,22 @@ async fn transfer_service_handler(mut rx: mpsc::Receiver<TransferEvent>, tx: mps
     while let Some(event) = rx.recv().await {
         match event {
             TransferEvent::ShareStarted { id, path } => {
-                tracing::info!("开始处理共享请求: id={}, path={:?}", id, path);
+                tracing::info!("=== 收到 ShareStarted 事件 ===");
+                tracing::info!("任务 ID: {}", id);
+                tracing::info!("文件路径: {:?}", path);
 
                 // 保存路径以便后续使用
                 pending_shares.insert(id, path.clone());
 
                 // 创建种子服务
+                tracing::info!("正在创建 TorrentFile...");
                 match TorrentFile::create(&path, None) {
                     Ok(torrent) => {
+                        tracing::info!("✓ TorrentFile 创建成功");
                         let info_hash = hex::encode(torrent.info_hash().unwrap_or([0u8; 20]));
                         let file_name = torrent.metainfo.info.name.clone();
+                        tracing::info!("文件名: {}", file_name);
+                        tracing::info!("Info Hash: {}", info_hash);
 
                         // 创建 PieceManager
                         let storage_path = if path.is_dir() {
@@ -1181,8 +1201,10 @@ async fn transfer_service_handler(mut rx: mpsc::Receiver<TransferEvent>, tx: mps
                         });
 
                         tracing::info!("共享完成: id={}, file={}, hash={}", id, file_name, info_hash);
+                        tracing::info!("✓ 发送 ShareCompleted 事件");
                     }
                     Err(e) => {
+                        tracing::error!("✗ TorrentFile 创建失败: {}", e);
                         tracing::error!("共享失败: id={}, reason={}", id, e);
                         // 发送失败事件
                         let _ = tx.send(TransferEvent::ShareFailed {

@@ -62,8 +62,33 @@ async fn main() -> sharSelf::Result<()> {
 
 /// 运行 TUI 界面
 async fn run_tui() -> sharSelf::Result<()> {
-    // 关闭日志输出，避免干扰 TUI
-    tracing::info!("Starting TUI interface...");
+    // 设置日志输出到文件
+    use std::fs::OpenOptions;
+    use std::sync::Mutex;
+    use tracing_subscriber::fmt;
+
+    // 创建日志文件
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/shareself.log")
+        .expect("无法创建日志文件");
+
+    // 创建文件日志订阅者
+    let subscriber = fmt()
+        .with_writer(Mutex::new(log_file))
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+
+    // 设置全局订阅者
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("无法设置日志订阅者");
+
+    tracing::info!("=== sharSelf TUI 启动 ===");
+    tracing::info!("时间: {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+    tracing::info!("日志文件: /tmp/shareself.log");
+    tracing::info!("提示: 在另一个终端运行 'tail -f /tmp/shareself.log' 查看实时日志");
 
     ui::run_tui().await
 }
