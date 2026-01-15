@@ -215,9 +215,14 @@ impl App {
             .into_string()
             .unwrap_or_else(|_| "Unknown".to_string());
 
+        // 获取本机 IP 地址
+        let local_ip = Self::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
+
         let mut txt_records = HashMap::new();
         txt_records.insert("version".to_string(), "0.1.0".to_string());
         txt_records.insert("platform".to_string(), Self::get_platform().to_string());
+        txt_records.insert("ip".to_string(), local_ip.clone());
+        txt_records.insert("bt_port".to_string(), DEFAULT_BT_PORT.to_string());
 
         let service_config = ServiceConfig {
             service_name: hostname.clone(),
@@ -645,20 +650,33 @@ impl App {
 
         tracing::info!("来源设备: {}", device_name);
 
-        // 获取设备地址和端口
-        let device_addr = self.viewing_device.as_ref()
-            .and_then(|d| d.get_address(false))
-            .or_else(|| self.viewing_device.as_ref().and_then(|d| d.get_address(true)))
-            .cloned()
+        // 获取设备的 IP 地址（优先从 TXT 记录中读取）
+        let device_ip = self.viewing_device.as_ref()
+            .and_then(|d| d.get_txt_value("ip"))
+            .map(|s| s.clone())
             .unwrap_or_else(|| {
-                tracing::warn!("无法获取设备地址，使用默认地址");
-                let port = self.viewing_device.as_ref()
-                    .and_then(|d| d.get_bt_port())
-                    .unwrap_or(6881);
-                SocketAddr::from(([127, 0, 0, 1], port))
+                // 如果 TXT 记录中没有 IP，尝试从设备地址中提取
+                self.viewing_device.as_ref()
+                    .and_then(|d| d.get_address(false))
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_else(|| "127.0.0.1".to_string())
             });
 
-        tracing::info!("设备地址: {}", device_addr);
+        // 获取 BitTorrent 端口（优先从 TXT 记录中读取）
+        let bt_port = self.viewing_device.as_ref()
+            .and_then(|d| d.get_bt_port())
+            .unwrap_or(DEFAULT_BT_PORT);
+
+        // 组合地址
+        let device_addr = match format!("{}:{}", device_ip, bt_port).parse::<SocketAddr>() {
+            Ok(addr) => addr,
+            Err(e) => {
+                tracing::error!("无效的设备地址 {}: {}: {}", device_ip, bt_port, e);
+                return;
+            }
+        };
+
+        tracing::info!("设备地址: {} (IP: {}, Port: {})", device_addr, device_ip, bt_port);
 
         // 分配任务 ID
         let task_id = self.allocate_task_id();
