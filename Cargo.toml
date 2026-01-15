@@ -1,0 +1,57 @@
+[package]
+name = "sharSelf"
+version = "0.1.0"
+edition = "2021"
+authors = ["sharSelf Contributors"]
+description = "A cross-platform local network file sharing library"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/user/sharSelf"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1.35", features = ["full"] }
+
+# DNS 协议
+trust-dns-client = "0.23"
+trust-dns-proto = "0.23"
+
+# 网络与 socket
+socket2 = "0.5"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 错误处理
+thiserror = "1"
+anyhow = "1"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 工具
+once_cell = "1.19"
+gethostname = "0.4"
+
+[[bin]]
+name = "shareself"
+path = "src/main.rs"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[build-dependencies]
+cbindgen = "0.26"
+
+# Android 特定配置
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21", optional = true }
+ndk-glue = { version = "0.7", optional = true }
+
+[features]
+default = []
+android = ["jni", "ndk-glue"]
