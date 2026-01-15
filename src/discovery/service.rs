@@ -3,7 +3,7 @@
 use super::types::DeviceInfo;
 use crate::common::{config::DiscoveryConfig, error::{Error, Result}};
 use crate::mdns::{socket::MdnsSocket, socket::MdnsSocketConfig, query::MdnsQuery, packet::{RecordType, RecordData}};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, broadcast};
 use tokio::time::Duration;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -215,20 +215,35 @@ async fn run_discovery(
     // 创建通道用于接收数据包
     let (packet_tx, mut packet_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(100);
 
+    // 创建 broadcast channel 用于通知阻塞线程退出
+    let (thread_shutdown_tx, _) = broadcast::channel::<()>(1);
+
     // 在独立线程中运行 socket 接收
-    tokio::task::spawn_blocking(move || {
-        let mut buffer = vec![0u8; 4096];
-        loop {
-            match recv_socket.recv_from(&mut buffer) {
-                Ok((size, addr)) => {
-                    let data = buffer[..size].to_vec();
-                    if let Err(e) = packet_tx.blocking_send((data, addr)) {
-                        tracing::debug!("Failed to send packet to channel: {}", e);
+    tokio::task::spawn_blocking({
+        let mut thread_shutdown_rx = thread_shutdown_tx.subscribe();
+        move || {
+            let mut buffer = vec![0u8; 4096];
+            loop {
+                // 检查是否收到关闭信号
+                match thread_shutdown_rx.try_recv() {
+                    Ok(_) | Err(broadcast::error::TryRecvError::Closed) | Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                        tracing::debug!("Discovery blocking thread received shutdown signal");
                         break;
                     }
+                    Err(broadcast::error::TryRecvError::Empty) => {}
                 }
-                Err(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+
+                match recv_socket.recv_from(&mut buffer) {
+                    Ok((size, addr)) => {
+                        let data = buffer[..size].to_vec();
+                        if let Err(e) = packet_tx.blocking_send((data, addr)) {
+                            tracing::debug!("Failed to send packet to channel: {}", e);
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
                 }
             }
         }
@@ -245,6 +260,13 @@ async fn run_discovery(
         tokio::select! {
             _ = &mut shutdown_rx => {
                 tracing::info!("Discovery service shutting down");
+
+                // 通知阻塞线程退出
+                let _ = thread_shutdown_tx.send(());
+
+                // 等待一小段时间让线程清理
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
                 break;
             }
 

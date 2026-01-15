@@ -1,5 +1,8 @@
 //! sharSelf 设备发现演示程序
 
+// TUI 模块
+mod ui;
+
 use sharSelf::{
     discovery::{discovery_service, DiscoveryEvent, register_service},
     common::config::{DiscoveryConfig, ServiceConfig},
@@ -32,6 +35,7 @@ async fn main() -> sharSelf::Result<()> {
     println!("  2. 浏览设备（发现局域网内的设备）");
     println!("  3. 同时运行（既注册又浏览）");
     println!("  4. 快速测试（注册 + 浏览 10 秒）");
+    println!("  5. TUI 界面（交互式终端界面）");
     println!("========================================");
 
     // 读取用户输入
@@ -44,11 +48,20 @@ async fn main() -> sharSelf::Result<()> {
         "2" => run_browser_only().await,
         "3" => run_both(hostname).await,
         "4" => run_quick_test(hostname).await,
+        "5" => run_tui().await,
         _ => {
-            println!("❌ 无效选择，运行快速测试...\n");
-            run_quick_test(hostname).await
+            println!("❌ 无效选择，运行 TUI 界面...\n");
+            run_tui().await
         }
     }
+}
+
+/// 运行 TUI 界面
+async fn run_tui() -> sharSelf::Result<()> {
+    // 关闭日志输出，避免干扰 TUI
+    tracing::info!("Starting TUI interface...");
+
+    ui::run_tui().await
 }
 
 /// 仅注册服务

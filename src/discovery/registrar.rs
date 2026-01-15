@@ -4,7 +4,7 @@
 
 use crate::common::{config::ServiceConfig, error::Result};
 use crate::mdns::{socket::MdnsSocket, socket::MdnsSocketConfig, packet::{MdnsPacket, MdnsRecord, RecordData, RecordType, RecordClass}};
-use tokio::sync::{oneshot, mpsc};
+use tokio::sync::{oneshot, mpsc, broadcast};
 use tokio::time::{interval, Duration};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -139,19 +139,36 @@ async fn run_registration(
     // 创建通道用于接收查询包
     let (query_tx, mut query_rx) = mpsc::channel::<(Vec<u8>, std::net::SocketAddr)>(100);
 
+    // 创建 broadcast channel 用于通知阻塞线程退出
+    let (thread_shutdown_tx, _) = broadcast::channel::<()>(1);
+
     // 在独立线程中运行 socket 接收
-    tokio::task::spawn_blocking(move || {
-        let mut buffer = vec![0u8; 4096];
-        loop {
-            match recv_socket.recv_from(&mut buffer) {
-                Ok((size, addr)) => {
-                    let data = buffer[..size].to_vec();
-                    if query_tx.blocking_send((data, addr)).is_err() {
+    tokio::task::spawn_blocking({
+        let mut thread_shutdown_rx = thread_shutdown_tx.subscribe();
+        move || {
+            let mut buffer = vec![0u8; 4096];
+            loop {
+                // 检查是否收到关闭信号
+                match thread_shutdown_rx.try_recv() {
+                    Ok(_) | Err(broadcast::error::TryRecvError::Closed) | Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                        tracing::debug!("Blocking thread received shutdown signal");
                         break;
                     }
+                    Err(broadcast::error::TryRecvError::Empty) => {}
                 }
-                Err(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+
+                // 使用超时 recv，避免永久阻塞
+                match recv_socket.recv_from(&mut buffer) {
+                    Ok((size, addr)) => {
+                        let data = buffer[..size].to_vec();
+                        if query_tx.blocking_send((data, addr)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        // 接收失败，短暂休眠后继续检查关闭信号
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
                 }
             }
         }
@@ -166,6 +183,12 @@ async fn run_registration(
                 if let Err(e) = send_goodbye(&send_socket, &config, &service_instance).await {
                     tracing::warn!("Failed to send goodbye message: {}", e);
                 }
+
+                // 通知阻塞线程退出
+                let _ = thread_shutdown_tx.send(());
+
+                // 等待一小段时间让线程清理
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
                 break;
             }

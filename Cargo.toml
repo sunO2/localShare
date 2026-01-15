@@ -38,6 +38,10 @@ once_cell = "1.19"
 gethostname = "0.4"
 get_if_addrs = "0.1"
 
+# TUI 界面
+ratatui = "0.26"
+crossterm = "0.27"
+
 [[bin]]
 name = "shareself"
 path = "src/main.rs"
