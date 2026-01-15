@@ -1,7 +1,6 @@
 //! 配置管理
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 
 /// 设备发现配置
 #[derive(Debug, Clone)]
@@ -57,6 +56,9 @@ pub struct ServiceConfig {
 
     /// TTL（生存时间，秒）
     pub ttl: u32,
+
+    /// 是否启用 IPv6
+    pub enable_ipv6: bool,
 }
 
 impl Default for ServiceConfig {
@@ -69,6 +71,7 @@ impl Default for ServiceConfig {
             domain: "local".to_string(),
             hostname: None,
             ttl: 120,
+            enable_ipv6: true,
         }
     }
 }

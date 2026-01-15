@@ -1,8 +1,9 @@
 //! mDNS 查询处理
 
-use crate::common::error::Result;
+use crate::common::error::{Error, Result};
 use super::packet::{MdnsPacket, MdnsQuestion, RecordType, RecordClass};
 use super::socket::MdnsSocket;
+use tokio::time::Duration;
 
 /// mDNS 查询类型
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +95,8 @@ impl MdnsQuery {
         let packet = self.build_packet();
         let data = packet.encode()?;
 
+        tracing::debug!("Sending mDNS query: {} questions", self.questions.len());
+
         // 发送到组播地址
         socket.send_to_v4(&data)?;
 
@@ -101,12 +104,61 @@ impl MdnsQuery {
     }
 
     /// 异步发送查询并等待响应
-    pub async fn send_and_recv(&self, socket: &MdnsSocket, timeout_ms: u64) -> Result<Vec<u8>> {
-        // TODO: 实现发送并等待响应的逻辑
-        // 1. 发送查询
-        // 2. 等待响应（超时）
-        // 3. 返回响应数据
-        Ok(Vec::new())
+    pub async fn send_and_recv(&self, socket: &MdnsSocket, timeout_ms: u64) -> Result<MdnsPacket> {
+        // 发送查询
+        self.send(socket)?;
+
+        // 等待响应 - 使用简单的轮询方式
+        let start = std::time::Instant::now();
+        let mut buffer = vec![0u8; 4096];
+
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed >= Duration::from_millis(timeout_ms) {
+                return Err(Error::Timeout);
+            }
+
+            // 尝试接收（非阻塞超时）
+            let recv_result = tokio::task::spawn_blocking({
+                // 不能直接移动 socket，所以创建新 socket 用于接收
+                let socket_config = super::socket::MdnsSocketConfig {
+                    enable_ipv6: true,
+                    ..Default::default()
+                };
+                move || {
+                    let recv_socket = MdnsSocket::new(socket_config)?;
+                    let mut buf = vec![0u8; 4096];
+                    recv_socket.recv_from(&mut buf).map(|(size, addr)| (buf, size, addr))
+                }
+            }).await;
+
+            match recv_result {
+                Ok(Ok((recv_buffer, size, addr))) => {
+                    // 解析响应
+                    match MdnsPacket::decode(&recv_buffer[..size]) {
+                        Ok(packet) if packet.is_response() => {
+                            tracing::debug!("Received mDNS response from {}", addr);
+                            return Ok(packet);
+                        }
+                        Ok(_) => {
+                            // 忽略查询包，继续等待
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse mDNS packet: {}", e);
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::trace!("Socket recv error: {}", e);
+                }
+                Err(e) => {
+                    tracing::trace!("Spawn blocking error: {}", e);
+                }
+            }
+
+            // 短暂休眠后继续尝试
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 

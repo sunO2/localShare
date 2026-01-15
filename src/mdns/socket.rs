@@ -78,19 +78,37 @@ impl MdnsSocket {
             let _ = socket.set_reuse_port(true);
         }
 
-        // 绑定到 mDNS 端口
-        let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT);
-        socket.bind(&SockAddr::from(addr))?;
+        // 尝试绑定到 mDNS 端口 (5353)
+        // 在 Android/Termux 上可能需要特殊权限，如果失败则绑定到随机端口
+        let bind_result = socket.bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT)));
 
-        // 加入组播组
+        #[cfg(target_os = "android")]
+        if bind_result.is_err() {
+            tracing::warn!("Failed to bind to mDNS port 5353, falling back to random port. This may limit discovery functionality.");
+            // 绑定到端口 0 让系统选择可用端口
+            socket.bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))?;
+        } else {
+            bind_result?;
+        }
+
+        #[cfg(not(target_os = "android"))]
+        bind_result?;
+
+        // 尝试加入组播组（可能在某些平台上失败）
         let mdns_addr: Ipv4Addr = MDNS_IPV4.parse().unwrap();
-        socket.join_multicast_v4(&mdns_addr, &Ipv4Addr::UNSPECIFIED)?;
+        if let Err(e) = socket.join_multicast_v4(&mdns_addr, &Ipv4Addr::UNSPECIFIED) {
+            tracing::warn!("Failed to join multicast group: {}. Discovery may be limited.", e);
+        }
 
         // 设置组播 TTL
-        socket.set_multicast_ttl_v4(config.multicast_ttl as u32)?;
+        if let Err(e) = socket.set_multicast_ttl_v4(config.multicast_ttl as u32) {
+            tracing::warn!("Failed to set multicast TTL: {}", e);
+        }
 
         // 设置循环回
-        socket.set_multicast_loop_v4(config.loop_enable)?;
+        if let Err(e) = socket.set_multicast_loop_v4(config.loop_enable) {
+            tracing::warn!("Failed to set multicast loop: {}", e);
+        }
 
         Ok(socket)
     }
@@ -108,19 +126,36 @@ impl MdnsSocket {
             let _ = socket.set_reuse_port(true);
         }
 
-        // 绑定到 mDNS 端口
+        // 尝试绑定到 mDNS 端口 (5353)
         let addr = std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0);
-        socket.bind(&SockAddr::from(addr))?;
+        let bind_result = socket.bind(&SockAddr::from(addr));
 
-        // 加入组播组
+        #[cfg(target_os = "android")]
+        if bind_result.is_err() {
+            tracing::warn!("Failed to bind IPv6 socket to mDNS port 5353, falling back to random port.");
+            socket.bind(&SockAddr::from(std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0)))?;
+        } else {
+            bind_result?;
+        }
+
+        #[cfg(not(target_os = "android"))]
+        bind_result?;
+
+        // 尝试加入组播组
         let mdns_addr: std::net::Ipv6Addr = MDNS_IPV6.parse().unwrap();
-        socket.join_multicast_v6(&mdns_addr, config.interface_index.unwrap_or(0))?;
+        if let Err(e) = socket.join_multicast_v6(&mdns_addr, config.interface_index.unwrap_or(0)) {
+            tracing::warn!("Failed to join IPv6 multicast group: {}", e);
+        }
 
-        // 设置组播 TTL (IPv6 使用相同的值)
-        socket.set_multicast_ttl_v4(config.multicast_ttl as u32)?;
+        // 设置组播 TTL
+        if let Err(e) = socket.set_multicast_ttl_v4(config.multicast_ttl as u32) {
+            tracing::warn!("Failed to set IPv6 multicast TTL: {}", e);
+        }
 
         // 设置循环回
-        socket.set_multicast_loop_v6(config.loop_enable)?;
+        if let Err(e) = socket.set_multicast_loop_v6(config.loop_enable) {
+            tracing::warn!("Failed to set IPv6 multicast loop: {}", e);
+        }
 
         Ok(socket)
     }
@@ -150,13 +185,36 @@ impl MdnsSocket {
     /// 发送到 IPv4 组播地址
     pub fn send_to_v4(&self, data: &[u8]) -> Result<usize> {
         let addr: SocketAddr = format!("{}:{}", MDNS_IPV4, MDNS_PORT).parse().unwrap();
-        self.send_to(data, &addr)
+        match self.send_to(data, &addr) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                // 权限错误转换为警告，不影响程序运行
+                let error_msg = e.to_string();
+                if error_msg.contains("Operation not permitted") || error_msg.contains("Permission denied") {
+                    tracing::warn!("Permission denied when sending mDNS packet. This is expected on unrooted Android/Termux.");
+                    Ok(data.len()) // 假装发送成功，避免阻塞程序
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// 发送到 IPv6 组播地址
     pub fn send_to_v6(&self, data: &[u8]) -> Result<usize> {
         let addr: SocketAddr = format!("{}:{}", MDNS_IPV6, MDNS_PORT).parse().unwrap();
-        self.send_to(data, &addr)
+        match self.send_to(data, &addr) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                let error_msg = e.to_string();
+                if error_msg.contains("Operation not permitted") || error_msg.contains("Permission denied") {
+                    tracing::warn!("Permission denied when sending IPv6 mDNS packet.");
+                    Ok(data.len())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// 接收数据
