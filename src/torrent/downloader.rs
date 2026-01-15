@@ -80,41 +80,77 @@ impl Downloader {
 
     /// 从 peer 获取 torrent 元数据
     pub async fn fetch_metadata(peer_addr: std::net::SocketAddr, info_hash_hex: &str) -> Result<Vec<u8>> {
-        tracing::info!("从 {} 获取元数据，hash: {}", peer_addr, info_hash_hex);
+        tracing::info!("=== 开始获取元数据 ===");
+        tracing::info!("从 {} 获取元数据", peer_addr);
+        tracing::info!("Info Hash (hex): {}", info_hash_hex);
 
         // 连接到元数据端口 (8080)
         let metadata_port = 8080;
         let metadata_addr = std::net::SocketAddr::new(peer_addr.ip(), metadata_port);
 
+        tracing::info!("连接到元数据服务器: {}", metadata_addr);
+
         match timeout(Duration::from_secs(5), TcpStream::connect(metadata_addr)).await {
             Ok(Ok(mut stream)) => {
+                tracing::info!("已连接到元数据服务器");
+
                 // 发送请求: 格式为 "GET /<info_hash>\n"
                 let request = format!("GET /{}\n", info_hash_hex);
+                tracing::debug!("发送请求: {}", request.trim());
+
                 stream.write_all(request.as_bytes()).await
-                    .map_err(|e| Error::Network(format!("Failed to send metadata request: {}", e)))?;
+                    .map_err(|e| {
+                        tracing::error!("发送元数据请求失败: {}", e);
+                        Error::Network(format!("Failed to send metadata request: {}", e))
+                    })?;
+
+                tracing::info!("等待元数据响应...");
 
                 // 读取响应长度 (4 字节)
                 let mut len_bytes = [0u8; 4];
                 stream.read_exact(&mut len_bytes).await
-                    .map_err(|e| Error::Network(format!("Failed to read metadata length: {}", e)))?;
+                    .map_err(|e| {
+                        tracing::error!("读取元数据长度失败: {}", e);
+                        Error::Network(format!("Failed to read metadata length: {}", e))
+                    })?;
                 let len = u32::from_be_bytes(len_bytes) as usize;
 
-                if len == 0 || len > 10 * 1024 * 1024 { // 最大 10MB
-                    return Err(Error::Other("Invalid metadata size".to_string()));
+                tracing::info!("元数据长度: {} 字节", len);
+
+                if len == 0 {
+                    let msg = format!(
+                        "元数据服务器返回空响应。可能原因:\n\
+                         1. 对方设备还没有共享此文件\n\
+                         2. 文件共享失败\n\
+                         3. Info Hash 不匹配\n\
+                         \n\
+                         请确保对方设备已成功共享文件，且两台设备在同一局域网内。"
+                    );
+                    tracing::warn!("{}", msg);
+                    return Err(Error::Other(msg));
+                }
+
+                if len > 10 * 1024 * 1024 { // 最大 10MB
+                    return Err(Error::Other(format!("元数据太大: {} bytes", len)));
                 }
 
                 // 读取元数据
                 let mut metadata = vec![0u8; len];
                 stream.read_exact(&mut metadata).await
-                    .map_err(|e| Error::Network(format!("Failed to read metadata: {}", e)))?;
+                    .map_err(|e| {
+                        tracing::error!("读取元数据失败: {}", e);
+                        Error::Network(format!("Failed to read metadata: {}", e))
+                    })?;
 
-                tracing::info!("成功获取 {} 字节的元数据", metadata.len());
+                tracing::info!("✓ 成功获取 {} 字节的元数据", metadata.len());
                 Ok(metadata)
             }
             Ok(Err(e)) => {
+                tracing::error!("连接元数据服务器失败: {}", e);
                 Err(Error::Network(format!("Failed to connect to metadata server: {}", e)))
             }
             Err(_) => {
+                tracing::error!("连接元数据服务器超时");
                 Err(Error::Timeout)
             }
         }
