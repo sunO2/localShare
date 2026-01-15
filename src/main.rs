@@ -6,8 +6,10 @@ mod ui;
 use sharSelf::{
     discovery::{discovery_service, DiscoveryEvent, register_service},
     common::config::{DiscoveryConfig, ServiceConfig},
+    torrent::{TorrentFile, DEFAULT_BT_PORT},
 };
 use std::collections::HashMap;
+use std::path::Path;
 use tokio::time::{timeout, Duration};
 
 #[tokio::main]
@@ -35,7 +37,8 @@ async fn main() -> sharSelf::Result<()> {
     println!("  2. 浏览设备（发现局域网内的设备）");
     println!("  3. 同时运行（既注册又浏览）");
     println!("  4. 快速测试（注册 + 浏览 10 秒）");
-    println!("  5. TUI 界面（交互式终端界面）");
+    println!("  5. 共享文件（通过 BitTorrent 分享文件）");
+    println!("  6. TUI 界面（交互式终端界面）");
     println!("========================================");
 
     // 读取用户输入
@@ -48,7 +51,8 @@ async fn main() -> sharSelf::Result<()> {
         "2" => run_browser_only().await,
         "3" => run_both(hostname).await,
         "4" => run_quick_test(hostname).await,
-        "5" => run_tui().await,
+        "5" => run_share_file().await,
+        "6" => run_tui().await,
         _ => {
             println!("❌ 无效选择，运行 TUI 界面...\n");
             run_tui().await
@@ -389,4 +393,119 @@ fn get_platform() -> &'static str {
         target_os = "freebsd"
     )))]
     return "Unknown";
+}
+
+/// 共享文件
+async fn run_share_file() -> sharSelf::Result<()> {
+    println!("\n📁 模式: 共享文件");
+    println!("----------------------------------------\n");
+
+    // 提示用户输入文件路径
+    println!("请输入要共享的文件或目录路径:");
+    let mut path_input = String::new();
+    std::io::stdin().read_line(&mut path_input).ok();
+    let path_str = path_input.trim();
+
+    let path = Path::new(path_str);
+
+    // 检查路径是否存在
+    if !path.exists() {
+        println!("❌ 路径不存在: {}", path_str);
+        return Ok(());
+    }
+
+    println!("\n⏳ 正在创建 torrent 文件...");
+
+    // 创建 torrent 文件
+    let torrent = match TorrentFile::create(path, None) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("❌ 创建 torrent 失败: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    println!("✅ Torrent 文件创建成功！\n");
+    println!("📋 Torrent 信息:");
+    println!("   ├─ 名称: {}", torrent.metainfo.info.name);
+    println!("   ├─ 大小: {} bytes", torrent.metainfo.total_size());
+    println!("   ├─ Piece 数量: {}", torrent.piece_count());
+    println!("   ├─ Piece 大小: {} bytes", torrent.metainfo.info.piece_length);
+
+    // 显示 info_hash
+    match torrent.info_hash() {
+        Ok(hash) => {
+            println!("   ├─ Info Hash: {}", hex::encode(hash));
+        }
+        Err(e) => {
+            println!("   ├─ Info Hash: 获取失败 ({})", e);
+        }
+    }
+
+    println!("   └─ 本地路径: {}\n", path_str);
+
+    // 获取本机 IP 地址
+    let local_ip = get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
+    let listen_addr = format!("{}:{}", local_ip, DEFAULT_BT_PORT);
+    let listen_addr = listen_addr.parse::<std::net::SocketAddr>()
+        .unwrap_or_else(|_| format!("0.0.0.0:{}", DEFAULT_BT_PORT).parse().unwrap());
+
+    println!("📡 正在启动种子服务...");
+    println!("   ├─ 监听地址: {}", listen_addr);
+    println!("   └─ 端口: {}\n", DEFAULT_BT_PORT);
+
+    // 创建 PieceManager
+    use sharSelf::torrent::PieceManager;
+    use std::sync::Arc;
+
+    let storage_path = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().unwrap_or(path).to_path_buf()
+    };
+
+    let piece_manager = Arc::new(PieceManager::new(
+        torrent.metainfo.clone(),
+        storage_path,
+    ));
+
+    // 创建并启动 Seeder
+    use sharSelf::torrent::Seeder;
+    let seeder = Seeder::new(
+        torrent.metainfo.clone(),
+        piece_manager.clone(),
+        listen_addr,
+    );
+
+    println!("✅ 种子服务已启动！\n");
+    println!("💡 其他设备可以通过以下方式连接:");
+    println!("   ├─ Info Hash (hex): {}\n", hex::encode(torrent.info_hash().unwrap_or([0u8; 20])));
+    println!("💡 提示: 按 Ctrl+C 停止共享\n");
+
+    // 在后台启动 seeder
+    let seeder_handle = tokio::spawn(async move {
+        let _ = seeder.start().await;
+    });
+
+    // 等待用户中断
+    tokio::signal::ctrl_c().await.ok();
+    println!("\n🛑 收到停止信号，正在关闭种子服务...");
+
+    // 取消 seeder 任务
+    seeder_handle.abort();
+
+    println!("✅ 已停止");
+
+    Ok(())
+}
+
+/// 获取本机 IP 地址
+fn get_local_ip() -> Option<String> {
+    use std::net::UdpSocket;
+
+    // 通过连接到一个外部地址来获取本机 IP
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    Some(local_addr.ip().to_string())
 }

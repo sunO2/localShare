@@ -4,7 +4,11 @@ use super::file_browser::FileBrowser;
 use sharSelf::discovery::{discovery_service, register_service, DiscoveryEvent, DeviceInfo};
 use sharSelf::common::config::{DiscoveryConfig, ServiceConfig};
 use sharSelf::common::error::Result;
-use std::collections::HashMap;
+use sharSelf::torrent::{TorrentFile, PieceManager, Seeder, DEFAULT_BT_PORT};
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent},
     execute,
@@ -15,10 +19,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap, Gauge},
     Frame, Terminal,
 };
-use std::{io, path::PathBuf, time::Duration, collections::HashSet};
+use std::{io, time::Duration};
 use tokio::sync::mpsc;
 
 /// 应用焦点
@@ -28,6 +32,59 @@ pub enum Focus {
     DeviceList,
     /// 文件浏览器
     FileBrowser,
+    /// 传输列表
+    TransferList,
+}
+
+/// 传输任务状态
+#[derive(Debug, Clone)]
+pub enum TransferStatus {
+    /// 准备中
+    Preparing,
+    /// 正在上传
+    Uploading { progress: f64 },
+    /// 正在下载
+    Downloading { progress: f64 },
+    /// 已完成
+    Completed,
+    /// 失败
+    Failed { reason: String },
+}
+
+/// 传输任务
+#[derive(Debug, Clone)]
+pub struct TransferTask {
+    /// 任务名称
+    pub name: String,
+    /// 对端设备
+    pub peer: String,
+    /// 文件大小
+    pub size: u64,
+    /// 状态
+    pub status: TransferStatus,
+    /// 是上传还是下载
+    pub is_upload: bool,
+    /// 任务 ID
+    pub id: usize,
+}
+
+/// 传输事件（用于异步通信）
+#[derive(Debug, Clone)]
+pub enum TransferEvent {
+    /// 共享开始
+    ShareStarted { id: usize, path: PathBuf },
+    /// 共享完成
+    ShareCompleted { id: usize, info_hash: String },
+    /// 共享失败
+    ShareFailed { id: usize, reason: String },
+    /// 下载开始
+    DownloadStarted { id: usize, name: String },
+    /// 下载进度
+    DownloadProgress { id: usize, progress: f64 },
+    /// 下载完成
+    DownloadCompleted { id: usize },
+    /// 下载失败
+    DownloadFailed { id: usize, reason: String },
 }
 
 /// TUI 应用程序
@@ -49,12 +106,39 @@ pub struct App {
     /// 发现服务句柄
     _discovery_handle: Option<sharSelf::discovery::service::ShutdownHandle>,
     /// 服务注册句柄
-    _service_handle: Option<sharSelf::discovery::registrar::ServiceHandle>,
+    service_handle: Option<sharSelf::discovery::registrar::ServiceHandle>,
+    /// 种子服务列表 (文件路径 -> (Torrent, Seeder句柄))
+    seeders: HashMap<PathBuf, (Arc<TorrentFile>, Option<tokio::task::JoinHandle<()>>)>,
+    /// 传输任务列表
+    transfers: Vec<TransferTask>,
+    /// 传输列表选中索引
+    transfer_selected: usize,
+    /// 当前本机监听地址
+    local_addr: SocketAddr,
+    /// PieceManager 管理器
+    piece_managers: HashMap<PathBuf, Arc<PieceManager>>,
+    /// 传输事件发送器
+    transfer_tx: mpsc::Sender<TransferEvent>,
+    /// 传输事件接收器
+    transfer_rx: Option<mpsc::Receiver<TransferEvent>>,
+    /// 下一个任务 ID
+    next_task_id: usize,
+    /// 共享文件列表 (名称 -> info_hash)
+    shared_files: HashMap<String, String>,
 }
 
 impl App {
     /// 创建新的 TUI 应用
     pub fn new(start_dir: PathBuf) -> Self {
+        // 获取本机 IP 地址
+        let local_ip = Self::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
+        let local_addr = format!("{}:{}", local_ip, DEFAULT_BT_PORT)
+            .parse::<SocketAddr>()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], DEFAULT_BT_PORT)));
+
+        // 创建传输事件通道
+        let (transfer_tx, transfer_rx) = mpsc::channel::<TransferEvent>(100);
+
         App {
             devices: Vec::new(),
             device_selected: 0,
@@ -64,8 +148,38 @@ impl App {
             running: true,
             event_rx: None,
             _discovery_handle: None,
-            _service_handle: None,
+            service_handle: None,
+            seeders: HashMap::new(),
+            transfers: Vec::new(),
+            transfer_selected: 0,
+            local_addr,
+            piece_managers: HashMap::new(),
+            transfer_tx,
+            transfer_rx: Some(transfer_rx),
+            next_task_id: 0,
+            shared_files: HashMap::new(),
         }
+    }
+
+    /// 获取传输事件发送器
+    pub fn transfer_tx(&self) -> mpsc::Sender<TransferEvent> {
+        self.transfer_tx.clone()
+    }
+
+    /// 分配新的任务 ID
+    fn allocate_task_id(&mut self) -> usize {
+        let id = self.next_task_id;
+        self.next_task_id += 1;
+        id
+    }
+
+    /// 获取本机 IP 地址
+    fn get_local_ip() -> Option<String> {
+        use std::net::UdpSocket;
+        let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("8.8.8.8:80").ok()?;
+        let local_addr = socket.local_addr().ok()?;
+        Some(local_addr.ip().to_string())
     }
 
     /// 启动设备发现和服务注册
@@ -92,7 +206,7 @@ impl App {
         match register_service(service_config) {
             Ok(service) => {
                 tracing::info!("Registered as mDNS service");
-                self._service_handle = Some(service);
+                self.service_handle = Some(service);
             }
             Err(e) => {
                 tracing::warn!("Failed to register service: {}, continuing with discovery only", e);
@@ -109,6 +223,32 @@ impl App {
         self._discovery_handle = Some(shutdown_handle);
 
         Ok(())
+    }
+
+    /// 广播共享文件信息到 mDNS
+    pub async fn broadcast_shared_files(&mut self) {
+        if self.shared_files.is_empty() {
+            return;
+        }
+
+        if let Some(service) = &mut self.service_handle {
+            // 构建新的 TXT 记录，包含共享文件信息
+            let mut txt_records = HashMap::new();
+            txt_records.insert("version".to_string(), "0.1.0".to_string());
+            txt_records.insert("platform".to_string(), Self::get_platform().to_string());
+
+            // 添加共享文件列表
+            for (name, hash) in &self.shared_files {
+                txt_records.insert(format!("file_{}", name), hash.clone());
+            }
+
+            // 更新 mDNS TXT 记录
+            if let Err(e) = service.update_txt(txt_records).await {
+                tracing::warn!("Failed to update mDNS TXT records: {}", e);
+            } else {
+                tracing::info!("Broadcasted {} shared files via mDNS", self.shared_files.len());
+            }
+        }
     }
 
     /// 获取平台信息
@@ -163,6 +303,7 @@ impl App {
         match self.focus {
             Focus::DeviceList => self.handle_device_list_keys(key),
             Focus::FileBrowser => self.handle_file_browser_keys(key),
+            Focus::TransferList => self.handle_transfer_list_keys(key),
         }
     }
 
@@ -238,6 +379,51 @@ impl App {
                 self.file_browser.select_last();
             }
             KeyCode::Tab | KeyCode::BackTab => {
+                // 切换焦点：设备列表 -> 文件浏览器 -> 传输列表
+                self.focus = match self.focus {
+                    Focus::DeviceList => Focus::FileBrowser,
+                    Focus::FileBrowser => Focus::TransferList,
+                    Focus::TransferList => Focus::DeviceList,
+                };
+            }
+            KeyCode::Char('s') => {
+                // 共享选中的文件/目录
+                self.start_sharing_selected_file();
+            }
+            KeyCode::Char('t') => {
+                // 切换到传输列表
+                self.focus = Focus::TransferList;
+            }
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.running = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// 处理传输列表键盘事件
+    fn handle_transfer_list_keys(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.transfer_selected > 0 {
+                    self.transfer_selected -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.transfer_selected + 1 < self.transfers.len() {
+                    self.transfer_selected += 1;
+                }
+            }
+            KeyCode::Char('d') => {
+                // 删除选中的传输任务
+                if self.transfer_selected < self.transfers.len() {
+                    self.transfers.remove(self.transfer_selected);
+                    if self.transfer_selected > 0 && self.transfer_selected >= self.transfers.len() {
+                        self.transfer_selected = self.transfers.len().saturating_sub(1);
+                    }
+                }
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
                 // 切换焦点
                 self.focus = Focus::DeviceList;
             }
@@ -245,6 +431,100 @@ impl App {
                 self.running = false;
             }
             _ => {}
+        }
+    }
+
+    /// 启动共享选中的文件
+    fn start_sharing_selected_file(&mut self) {
+        // 先克隆需要的数据
+        let (item_name, item_size) = match self.file_browser.selected_file() {
+            Some(item) => (item.name.clone(), item.size),
+            None => return,
+        };
+
+        let item_path = self.file_browser.current_dir().join(&item_name);
+
+        // 检查是否已经在共享
+        if self.seeders.contains_key(&item_path) {
+            return;
+        }
+
+        // 分配任务 ID
+        let task_id = self.allocate_task_id();
+
+        // 创建传输任务
+        let task = TransferTask {
+            name: item_name.clone(),
+            peer: "所有人".to_string(),
+            size: item_size,
+            status: TransferStatus::Preparing,
+            is_upload: true,
+            id: task_id,
+        };
+        self.transfers.push(task);
+
+        // 发送共享开始事件（克隆 path 避免移动）
+        let _ = self.transfer_tx.try_send(TransferEvent::ShareStarted {
+            id: task_id,
+            path: item_path.clone(),
+        });
+
+        tracing::info!("准备共享文件: {:?}", item_path);
+    }
+
+    /// 处理传输事件
+    pub fn handle_transfer_events(&mut self) {
+        if let Some(rx) = &mut self.transfer_rx {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    TransferEvent::ShareStarted { id, path } => {
+                        tracing::info!("共享开始: id={}, path={:?}", id, path);
+                        // 更新任务状态
+                        if let Some(task) = self.transfers.iter_mut().find(|t| t.id == id) {
+                            task.status = TransferStatus::Preparing;
+                        }
+                    }
+                    TransferEvent::ShareCompleted { id, info_hash } => {
+                        tracing::info!("共享完成: id={}, hash={}", id, info_hash);
+                        if let Some(task) = self.transfers.iter_mut().find(|t| t.id == id) {
+                            task.status = TransferStatus::Uploading { progress: 0.0 };
+                            task.peer = format!("Hash: {}", &info_hash[..16]);
+
+                            // 添加到共享文件列表
+                            self.shared_files.insert(task.name.clone(), info_hash);
+                        }
+                    }
+                    TransferEvent::ShareFailed { id, reason } => {
+                        tracing::warn!("共享失败: id={}, reason={}", id, reason);
+                        if let Some(task) = self.transfers.iter_mut().find(|t| t.id == id) {
+                            task.status = TransferStatus::Failed { reason };
+                        }
+                    }
+                    TransferEvent::DownloadStarted { id, name } => {
+                        tracing::info!("下载开始: id={}, name={}", id, name);
+                        if let Some(task) = self.transfers.iter_mut().find(|t| t.id == id) {
+                            task.status = TransferStatus::Downloading { progress: 0.0 };
+                        }
+                    }
+                    TransferEvent::DownloadProgress { id, progress } => {
+                        if let Some(task) = self.transfers.iter_mut().find(|t| t.id == id) {
+                            task.status = TransferStatus::Downloading { progress };
+                        }
+                    }
+                    TransferEvent::DownloadCompleted { id } => {
+                        tracing::info!("下载完成: id={}", id);
+                        if let Some(task) = self.transfers.iter_mut().find(|t| t.id == id) {
+                            task.status = TransferStatus::Completed;
+                        }
+                    }
+                    TransferEvent::DownloadFailed { id, reason } => {
+                        tracing::warn!("下载失败: id={}, reason={}", id, reason);
+                        if let Some(task) = self.transfers.iter_mut().find(|t| t.id == id) {
+                            task.status = TransferStatus::Failed { reason };
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -260,13 +540,22 @@ impl App {
 
     /// 绘制 UI
     pub fn draw(&self, f: &mut Frame) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(33), Constraint::Percentage(67)].as_ref())
-            .split(f.size());
+        match self.focus {
+            Focus::TransferList => {
+                // 传输列表全屏显示
+                self.draw_transfer_list(f, f.size());
+            }
+            _ => {
+                // 设备列表和文件浏览器
+                let chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(33), Constraint::Percentage(67)].as_ref())
+                    .split(f.size());
 
-        self.draw_device_list(f, chunks[0]);
-        self.draw_file_browser(f, chunks[1]);
+                self.draw_device_list(f, chunks[0]);
+                self.draw_file_browser(f, chunks[1]);
+            }
+        }
     }
 
     /// 绘制设备列表
@@ -352,7 +641,7 @@ impl App {
         let help_text = if self.focus == Focus::DeviceList {
             " ↑/k:上 ↓/j:下 Space:选择 a:全选 Tab:切换 q:退出"
         } else {
-            " ↑/k:上 ↓/j:下 Enter:进入 ←/h:返回 Tab:切换 q:退出"
+            " ↑/k:上 ↓/j:下 Enter:进入 ←/h:返回 s:共享 t:传输 Tab:切换 q:退出"
         };
 
         let items: Vec<ListItem> = self
@@ -412,6 +701,108 @@ impl App {
 
         f.render_widget(path_text, path_area);
     }
+
+    /// 绘制传输列表
+    fn draw_transfer_list(&self, f: &mut Frame, area: Rect) {
+        let title = Line::from(vec![
+            Span::raw(" 传输列表 "),
+            Span::styled(
+                format!("({})", self.transfers.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                if self.focus == Focus::TransferList { "[聚焦]" } else { "" },
+                Style::default().fg(Color::Cyan),
+            ),
+        ]);
+
+        let items: Vec<ListItem> = self
+            .transfers
+            .iter()
+            .enumerate()
+            .map(|(i, transfer)| {
+                let is_selected = i == self.transfer_selected && self.focus == Focus::TransferList;
+
+                let style = if is_selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+
+                // 方向图标
+                let direction = if transfer.is_upload { "↑ " } else { "↓ " };
+                let direction_style = Style::default().fg(if transfer.is_upload { Color::Green } else { Color::Blue });
+
+                // 状态图标和颜色
+                let (status_icon, status_color) = match &transfer.status {
+                    TransferStatus::Preparing => ("⏳", Color::Yellow),
+                    TransferStatus::Uploading { .. } => ("↑", Color::Green),
+                    TransferStatus::Downloading { .. } => ("↓", Color::Blue),
+                    TransferStatus::Completed => ("✓", Color::Green),
+                    TransferStatus::Failed { .. } => ("✗", Color::Red),
+                };
+
+                // 进度百分比
+                let progress = match &transfer.status {
+                    TransferStatus::Uploading { progress } |
+                    TransferStatus::Downloading { progress } => *progress,
+                    TransferStatus::Completed => 1.0,
+                    _ => 0.0,
+                };
+
+                let content = vec![
+                    Line::from(vec![
+                        Span::styled(direction, direction_style),
+                        Span::styled(&transfer.name, style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            format!("    {} {} | ", status_icon, transfer.peer),
+                            Style::default().fg(status_color),
+                        ),
+                        Span::styled(
+                            format!("{} | {}", format_size(transfer.size), format_progress(progress)),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]),
+                ];
+
+                ListItem::new(content)
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(title));
+
+        f.render_widget(list, area);
+
+        // 绘制操作提示
+        let help_area = Rect {
+            y: area.y + area.height - 3,
+            height: 3,
+            ..area
+        };
+
+        let help_text = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    " ↑/k:上 ↓/j:下 d:删除 Tab:切换 t:返回 q:退出",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(" 操作提示 "))
+        .wrap(Wrap { trim: false });
+
+        f.render_widget(help_text, help_area);
+    }
+}
+
+/// 格式化进度百分比
+fn format_progress(progress: f64) -> String {
+    format!("{:.1}%", progress * 100.0)
 }
 
 /// 格式化文件大小
@@ -449,8 +840,18 @@ pub async fn run_tui() -> Result<()> {
     // 启动设备发现
     app.start_discovery().await?;
 
+    // 获取传输事件接收器和发送器，并启动传输服务
+    let transfer_rx = app.transfer_rx.take().unwrap();
+    let transfer_tx = app.transfer_tx();
+    let transfer_service = tokio::spawn(async move {
+        transfer_service_handler(transfer_rx, transfer_tx).await;
+    });
+
     // 运行主循环
     let result = run_app(&mut terminal, &mut app).await;
+
+    // 取消传输服务
+    transfer_service.abort();
 
     // 恢复终端
     disable_raw_mode()?;
@@ -464,6 +865,89 @@ pub async fn run_tui() -> Result<()> {
     result
 }
 
+/// 传输服务处理器 - 在后台处理所有文件传输任务
+async fn transfer_service_handler(mut rx: mpsc::Receiver<TransferEvent>, tx: mpsc::Sender<TransferEvent>) {
+    let mut pending_shares: HashMap<usize, PathBuf> = HashMap::new();
+    let mut active_seeders: HashMap<PathBuf, (Arc<TorrentFile>, tokio::task::JoinHandle<()>)> = HashMap::new();
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            TransferEvent::ShareStarted { id, path } => {
+                tracing::info!("开始处理共享请求: id={}, path={:?}", id, path);
+
+                // 保存路径以便后续使用
+                pending_shares.insert(id, path.clone());
+
+                // 创建种子服务
+                match TorrentFile::create(&path, None) {
+                    Ok(torrent) => {
+                        let info_hash = hex::encode(torrent.info_hash().unwrap_or([0u8; 20]));
+                        let file_name = torrent.metainfo.info.name.clone();
+
+                        // 创建 PieceManager
+                        let storage_path = if path.is_dir() {
+                            path.clone()
+                        } else {
+                            path.parent().unwrap_or(&path).to_path_buf()
+                        };
+                        let piece_manager = Arc::new(PieceManager::new(
+                            torrent.metainfo.clone(),
+                            storage_path,
+                        ));
+
+                        // 启动 Seeder
+                        let local_ip = get_local_ip_for_seeder().unwrap_or_else(|| "0.0.0.0".to_string());
+                        let listen_addr = format!("{}:{}", local_ip, DEFAULT_BT_PORT)
+                            .parse::<SocketAddr>()
+                            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], DEFAULT_BT_PORT)));
+
+                        let seeder = Seeder::new(
+                            torrent.metainfo.clone(),
+                            piece_manager.clone(),
+                            listen_addr,
+                        );
+
+                        // 在后台启动 seeder
+                        let seeder_handle = tokio::spawn(async move {
+                            let _ = seeder.start().await;
+                        });
+
+                        active_seeders.insert(path.clone(), (Arc::new(torrent.clone()), seeder_handle));
+
+                        // 发送完成事件（克隆 info_hash）
+                        let _ = tx.send(TransferEvent::ShareCompleted {
+                            id,
+                            info_hash: info_hash.clone(),
+                        });
+
+                        tracing::info!("共享完成: id={}, file={}, hash={}", id, file_name, info_hash);
+                    }
+                    Err(e) => {
+                        tracing::error!("共享失败: id={}, reason={}", id, e);
+                        // 发送失败事件
+                        let _ = tx.send(TransferEvent::ShareFailed {
+                            id,
+                            reason: e.to_string(),
+                        });
+                    }
+                }
+            }
+            _ => {
+                // 其他事件暂不处理
+            }
+        }
+    }
+}
+
+/// 获取本机 IP（用于种子服务）
+fn get_local_ip_for_seeder() -> Option<String> {
+    use std::net::UdpSocket;
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    Some(local_addr.ip().to_string())
+}
+
 /// 运行应用主循环
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -474,6 +958,9 @@ async fn run_app(
     loop {
         // 处理设备发现事件
         app.handle_discovery_events();
+
+        // 处理传输事件
+        app.handle_transfer_events();
 
         // 绘制 UI
         terminal.draw(|f| app.draw(f))?;

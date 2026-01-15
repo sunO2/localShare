@@ -7,6 +7,9 @@ use crate::mdns::{socket::MdnsSocket, socket::MdnsSocketConfig, packet::{MdnsPac
 use tokio::sync::{oneshot, mpsc, broadcast};
 use tokio::time::{interval, Duration};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// 服务注册句柄
 ///
@@ -20,6 +23,9 @@ pub struct ServiceHandle {
 
     /// 后台任务句柄
     task_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// TXT 记录更新发送器
+    txt_update_tx: mpsc::Sender<HashMap<String, String>>,
 }
 
 impl ServiceHandle {
@@ -29,9 +35,10 @@ impl ServiceHandle {
     }
 
     /// 更新 TXT 记录
-    pub async fn update_txt(&mut self, _records: std::collections::HashMap<String, String>) -> Result<()> {
-        // TODO: 发送 mDNS 更新，包含新的 TXT 记录
-        tracing::info!("Updating TXT records for service: {}", self.service_name);
+    pub async fn update_txt(&mut self, records: HashMap<String, String>) -> Result<()> {
+        self.txt_update_tx.send(records).await
+            .map_err(|e| crate::common::error::Error::Other(format!("Failed to update TXT: {}", e)))?;
+        tracing::info!("TXT records update requested for service: {}", self.service_name);
         Ok(())
     }
 
@@ -66,28 +73,35 @@ impl ServiceHandle {
 /// 返回服务句柄，用于控制已注册的服务
 pub fn register_service(config: ServiceConfig) -> Result<ServiceHandle> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (txt_update_tx, mut txt_update_rx) = mpsc::channel::<HashMap<String, String>>(10);
 
     let service_name = config.service_name.clone();
     let port = config.port;
 
     tracing::info!("Registering service: {} on port {}", service_name, port);
 
+    // 将初始 TXT 记录包装在 Arc 中以便共享
+    let txt_records = Arc::new(RwLock::new(config.txt_records.clone()));
+
     // 启动 mDNS 广播任务
     let task_handle = tokio::spawn(async move {
-        run_registration(config, shutdown_rx).await;
+        run_registration_with_updates(config, shutdown_rx, txt_update_rx, txt_records).await;
     });
 
     Ok(ServiceHandle {
         service_name,
         shutdown_tx: Some(shutdown_tx),
         task_handle: Some(task_handle),
+        txt_update_tx,
     })
 }
 
-/// 运行服务注册的内部逻辑
-async fn run_registration(
+/// 运行服务注册的内部逻辑（支持动态更新）
+async fn run_registration_with_updates(
     config: ServiceConfig,
     mut shutdown_rx: oneshot::Receiver<()>,
+    mut txt_update_rx: mpsc::Receiver<HashMap<String, String>>,
+    txt_records: Arc<RwLock<HashMap<String, String>>>,
 ) {
     tracing::info!("Starting service registration for {}", config.service_name);
 
@@ -128,7 +142,7 @@ async fn run_registration(
     }
 
     // 首次通告
-    if let Err(e) = send_announcement(&send_socket, &config, &service_instance, &local_ips).await {
+    if let Err(e) = send_announcement_with_txt(&send_socket, &config, &service_instance, &local_ips, &txt_records).await {
         tracing::warn!("Failed to send initial announcement: {}", e);
     }
 
@@ -193,16 +207,28 @@ async fn run_registration(
                 break;
             }
 
+            Some(new_txt) = txt_update_rx.recv() => {
+                // 更新 TXT 记录
+                *txt_records.write().await = new_txt;
+
+                // 立即发送新的通告
+                if let Err(e) = send_announcement_with_txt(&send_socket, &config, &service_instance, &local_ips, &txt_records).await {
+                    tracing::warn!("Failed to send updated announcement: {}", e);
+                }
+
+                tracing::info!("TXT records updated and announcement sent for {}", config.service_name);
+            }
+
             _ = ticker.tick() => {
                 // 定期重新发送通告
-                if let Err(e) = send_announcement(&send_socket, &config, &service_instance, &local_ips).await {
+                if let Err(e) = send_announcement_with_txt(&send_socket, &config, &service_instance, &local_ips, &txt_records).await {
                     tracing::warn!("Failed to send periodic announcement: {}", e);
                 }
             }
 
             Some((data, addr)) = query_rx.recv() => {
                 // 处理接收到的查询包
-                if let Err(e) = handle_query_packet(&data, addr, &send_socket, &config, &service_instance, &local_ips).await {
+                if let Err(e) = handle_query_packet(&data, addr, &send_socket, &config, &service_instance, &local_ips, &txt_records).await {
                     tracing::trace!("Failed to handle query packet: {}", e);
                 }
             }
@@ -212,14 +238,17 @@ async fn run_registration(
     tracing::info!("Service registration stopped");
 }
 
-/// 发送服务通告
-async fn send_announcement(
+/// 发送服务通告（使用动态 TXT 记录）
+async fn send_announcement_with_txt(
     socket: &MdnsSocket,
     config: &ServiceConfig,
     service_instance: &str,
     local_ips: &[IpAddr],
+    txt_records: &Arc<RwLock<HashMap<String, String>>>,
 ) -> Result<()> {
-    let packet = build_announcement_packet(config, service_instance, local_ips)?;
+    let txt = txt_records.read().await;
+    let packet = build_announcement_packet_with_txt(config, service_instance, local_ips, &txt)?;
+    drop(txt);
     let data = packet.encode()?;
 
     tracing::debug!("Sending service announcement for {}", service_instance);
@@ -265,6 +294,7 @@ async fn handle_query_packet(
     config: &ServiceConfig,
     service_instance: &str,
     local_ips: &[IpAddr],
+    txt_records: &Arc<RwLock<HashMap<String, String>>>,
 ) -> Result<()> {
     use crate::mdns::packet::MdnsPacket;
 
@@ -303,7 +333,7 @@ async fn handle_query_packet(
         tracing::debug!("Responding to mDNS query from {}", _source);
 
         // 发送响应
-        let response = build_response_packet(config, service_instance, local_ips)?;
+        let response = build_response_packet_with_txt(config, service_instance, local_ips, txt_records).await?;
         let response_data = response.encode()?;
 
         socket.send_to_v4(&response_data)?;
@@ -312,11 +342,12 @@ async fn handle_query_packet(
     Ok(())
 }
 
-/// 构建通告数据包
-fn build_announcement_packet(
+/// 构建通告数据包（使用动态 TXT）
+fn build_announcement_packet_with_txt<'a>(
     config: &ServiceConfig,
     service_instance: &str,
     local_ips: &[IpAddr],
+    txt_records: &'a HashMap<String, String>,
 ) -> Result<MdnsPacket> {
     let mut packet = MdnsPacket::response();
 
@@ -349,7 +380,7 @@ fn build_announcement_packet(
     });
 
     // 3. TXT 记录 (服务实例 -> 文本信息)
-    let txt_strings: Vec<String> = config.txt_records.iter()
+    let txt_strings: Vec<String> = txt_records.iter()
         .map(|(k, v)| format!("{}={}", k, v))
         .collect();
 
@@ -364,6 +395,87 @@ fn build_announcement_packet(
     }
 
     // 4. A/AAAA 记录 (主机名 -> IP 地址)
+    for ip in local_ips {
+        match ip {
+            IpAddr::V4(addr) => {
+                packet.additionals.push(MdnsRecord {
+                    name: hostname.clone(),
+                    rtype: RecordType::A,
+                    rclass: RecordClass::IN,
+                    ttl: config.ttl,
+                    data: RecordData::A(*addr),
+                });
+            }
+            IpAddr::V6(addr) => {
+                packet.additionals.push(MdnsRecord {
+                    name: hostname.clone(),
+                    rtype: RecordType::AAAA,
+                    rclass: RecordClass::IN,
+                    ttl: config.ttl,
+                    data: RecordData::Aaaa(*addr),
+                });
+            }
+        }
+    }
+
+    Ok(packet)
+}
+
+/// 构建响应数据包（使用动态 TXT）
+async fn build_response_packet_with_txt(
+    config: &ServiceConfig,
+    service_instance: &str,
+    local_ips: &[IpAddr],
+    txt_records: &Arc<RwLock<HashMap<String, String>>>,
+) -> Result<MdnsPacket> {
+    let txt = txt_records.read().await;
+    let mut packet = MdnsPacket::response();
+
+    // PTR 记录
+    let ptr_name = format!("{}.local", config.service_type);
+    packet.answers.push(MdnsRecord {
+        name: ptr_name,
+        rtype: RecordType::PTR,
+        rclass: RecordClass::IN,
+        ttl: config.ttl,
+        data: RecordData::Ptr(service_instance.to_string()),
+    });
+
+    // SRV 记录
+    let hostname = config.hostname.as_ref()
+        .map(|h| format!("{}.local", h))
+        .unwrap_or_else(|| service_instance.split('.').next().unwrap_or("localhost").to_string() + ".local");
+
+    packet.additionals.push(MdnsRecord {
+        name: service_instance.to_string(),
+        rtype: RecordType::SRV,
+        rclass: RecordClass::IN,
+        ttl: config.ttl,
+        data: RecordData::Srv {
+            priority: 0,
+            weight: 0,
+            port: config.port,
+            target: hostname.clone(),
+        },
+    });
+
+    // TXT 记录
+    let txt_strings: Vec<String> = txt.iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect();
+    drop(txt);
+
+    if !txt_strings.is_empty() {
+        packet.additionals.push(MdnsRecord {
+            name: service_instance.to_string(),
+            rtype: RecordType::TXT,
+            rclass: RecordClass::IN,
+            ttl: config.ttl,
+            data: RecordData::Txt(txt_strings),
+        });
+    }
+
+    // A/AAAA 记录
     for ip in local_ips {
         match ip {
             IpAddr::V4(addr) => {
@@ -424,85 +536,6 @@ fn build_goodbye_packet(
             target: hostname,
         },
     });
-
-    Ok(packet)
-}
-
-/// 构建响应数据包（响应查询）
-fn build_response_packet(
-    config: &ServiceConfig,
-    service_instance: &str,
-    local_ips: &[IpAddr],
-) -> Result<MdnsPacket> {
-    // 响应包与通告包类似，但设置不同的标志
-    let mut packet = MdnsPacket::response();
-
-    // PTR 记录
-    let ptr_name = format!("{}.local", config.service_type);
-    packet.answers.push(MdnsRecord {
-        name: ptr_name,
-        rtype: RecordType::PTR,
-        rclass: RecordClass::IN,
-        ttl: config.ttl,
-        data: RecordData::Ptr(service_instance.to_string()),
-    });
-
-    // SRV 记录
-    let hostname = config.hostname.as_ref()
-        .map(|h| format!("{}.local", h))
-        .unwrap_or_else(|| service_instance.split('.').next().unwrap_or("localhost").to_string() + ".local");
-
-    packet.additionals.push(MdnsRecord {
-        name: service_instance.to_string(),
-        rtype: RecordType::SRV,
-        rclass: RecordClass::IN,
-        ttl: config.ttl,
-        data: RecordData::Srv {
-            priority: 0,
-            weight: 0,
-            port: config.port,
-            target: hostname.clone(),
-        },
-    });
-
-    // TXT 记录
-    let txt_strings: Vec<String> = config.txt_records.iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect();
-
-    if !txt_strings.is_empty() {
-        packet.additionals.push(MdnsRecord {
-            name: service_instance.to_string(),
-            rtype: RecordType::TXT,
-            rclass: RecordClass::IN,
-            ttl: config.ttl,
-            data: RecordData::Txt(txt_strings),
-        });
-    }
-
-    // A/AAAA 记录
-    for ip in local_ips {
-        match ip {
-            IpAddr::V4(addr) => {
-                packet.additionals.push(MdnsRecord {
-                    name: hostname.clone(),
-                    rtype: RecordType::A,
-                    rclass: RecordClass::IN,
-                    ttl: config.ttl,
-                    data: RecordData::A(*addr),
-                });
-            }
-            IpAddr::V6(addr) => {
-                packet.additionals.push(MdnsRecord {
-                    name: hostname.clone(),
-                    rtype: RecordType::AAAA,
-                    rclass: RecordClass::IN,
-                    ttl: config.ttl,
-                    data: RecordData::Aaaa(*addr),
-                });
-            }
-        }
-    }
 
     Ok(packet)
 }

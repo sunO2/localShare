@@ -40,6 +40,7 @@ get_if_addrs = "0.1"
 walkdir = "2.4"
 sha1 = "0.10"
 rand = "0.8"
+hex = "0.4"
 
 # TUI 界面
 ratatui = "0.26"
