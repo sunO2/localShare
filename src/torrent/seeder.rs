@@ -226,7 +226,15 @@ impl Seeder {
                     }
                 }
             }
-            Message::Choke | Message::Unchoke | Message::Interested | Message::NotInterested => {
+            Message::Interested => {
+                // Leecher 感兴趣，发送 unchoke 允许下载
+                tracing::debug!("收到 interested 消息，发送 unchoke");
+                let unchoke_msg = Message::Unchoke;
+                let msg_bytes = unchoke_msg.to_bytes();
+                writer.write_all(&msg_bytes).await?;
+                writer.flush().await?;
+            }
+            Message::Choke | Message::Unchoke | Message::NotInterested => {
                 // 忽略这些消息
             }
             _ => {
