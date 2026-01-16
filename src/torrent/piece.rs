@@ -466,4 +466,13 @@ impl PieceManager {
         let pieces = self.pieces.read().await;
         pieces.get(index).map(|p| p.state)
     }
+
+    /// 标记所有 pieces 为已完成（用于种子场景）
+    pub async fn mark_all_completed(&self) {
+        let mut pieces = self.pieces.write().await;
+        for piece in pieces.iter_mut() {
+            piece.state = PieceState::Completed;
+        }
+        tracing::info!("已标记所有 {} 个 pieces 为已完成（种子模式）", pieces.len());
+    }
 }

@@ -1292,6 +1292,9 @@ async fn transfer_service_handler(
                             storage_path,
                         ));
 
+                        // 标记所有 pieces 为已完成（种子模式）
+                        piece_manager.mark_all_completed().await;
+
                         // 启动 Seeder
                         let local_ip = get_local_ip_for_seeder().unwrap_or_else(|| "0.0.0.0".to_string());
                         let listen_addr = format!("{}:{}", local_ip, DEFAULT_BT_PORT)
