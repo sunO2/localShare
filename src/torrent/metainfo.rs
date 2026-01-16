@@ -281,23 +281,18 @@ impl TorrentMetaInfo {
 
     /// 编码为 bencode 格式
     pub fn to_bencode(&self) -> Result<Vec<u8>> {
+        use crate::torrent::bencode::BencodeValue;
+
         let mut dict = BTreeMap::new();
 
-        if let Some(announce) = &self.announce {
-            dict.insert(b"announce".to_vec(), BencodeValue::Bytes(announce.as_bytes().to_vec()));
-        }
+        // 注：不编码 creation_date，因为它可能导致负数问题
+        // if let Some(announce) = &self.announce {
+        //     dict.insert(b"announce".to_vec(), BencodeValue::Bytes(announce.as_bytes().to_vec()));
+        // }
 
-        if let Some(created_by) = &self.created_by {
-            dict.insert(b"created by".to_vec(), BencodeValue::Bytes(created_by.as_bytes().to_vec()));
-        }
-
-        if let Some(creation_date) = &self.creation_date {
-            dict.insert(b"creation date".to_vec(), BencodeValue::Int(*creation_date));
-        }
-
-        if let Some(encoding) = &self.encoding {
-            dict.insert(b"encoding".to_vec(), BencodeValue::Bytes(encoding.as_bytes().to_vec()));
-        }
+        // if let Some(created_by) = &self.created_by {
+        //     dict.insert(b"created by".to_vec(), BencodeValue::Bytes(created_by.as_bytes().to_vec()));
+        // }
 
         // 编码 info 字典
         let mut info_dict = BTreeMap::new();
@@ -332,7 +327,12 @@ impl TorrentMetaInfo {
         dict.insert(b"info".to_vec(), BencodeValue::Dict(info_dict));
 
         // 编码
-        Ok(BencodeValue::Dict(dict).encode())
+        let encoded = BencodeValue::Dict(dict).encode();
+
+        tracing::debug!("编码后的 bencode 数据长度: {} 字节", encoded.len());
+        tracing::debug!("前 100 字节: {:?}", &encoded[..encoded.len().min(100)]);
+
+        Ok(encoded)
     }
 
     /// 从 bencode 数据解析
