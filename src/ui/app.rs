@@ -266,10 +266,15 @@ impl App {
         tracing::info!("Attempting to broadcast {} shared files", self.shared_files.len());
 
         if let Some(service) = &mut self.service_handle {
+            // 获取本机 IP 地址
+            let local_ip = Self::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
+
             // 构建新的 TXT 记录，包含共享文件信息
             let mut txt_records = HashMap::new();
             txt_records.insert("version".to_string(), "0.1.0".to_string());
             txt_records.insert("platform".to_string(), Self::get_platform().to_string());
+            txt_records.insert("ip".to_string(), local_ip);
+            txt_records.insert("bt_port".to_string(), DEFAULT_BT_PORT.to_string());
 
             // 添加共享文件列表
             for (name, hash) in &self.shared_files {
