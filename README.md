@@ -13,7 +13,11 @@ sharSelf 是一个灵活的局域网文件分享解决方案，设计为可编�
   - 支持文件分块和并行下载
   - 自动进度跟踪和恢复
   - Piece 完整性验证（SHA1）
+  - 元数据服务器：自动分发 torrent 元数据
 - **TUI 界面**: 交互式终端界面，支持文件浏览和传输管理
+  - 实时下载进度显示
+  - 文件大小显示
+  - 已下载字节跟踪
 - **多平台支持**: 支持 Linux、macOS、Windows、Android
 
 ---
@@ -28,6 +32,7 @@ sharSelf 是一个灵活的局域网文件分享解决方案，设计为可编�
 |------|------|------|------|
 | 服务广播 | mDNS | 5353 | UDP 组播 224.0.0.251 (IPv4) / ff02::fb (IPv6) |
 | 服务类型 | DNS-SD | - | `_shareself._tcp.local` |
+| 元数据服务 | HTTP | 8080 | Torrent 元数据分发 |
 
 ### 模块架构
 
@@ -53,11 +58,13 @@ src/
 ├── torrent/                   # BitTorrent 文件传输模块
 │   ├── mod.rs
 │   ├── metainfo.rs            # Torrent 文件格式 ✅
+│   ├── bencode.rs             # Bencode 编解码 ✅
 │   ├── piece.rs               # Piece 管理和验证 ✅
 │   ├── protocol.rs            # BitWire 协议 ✅
 │   ├── peer.rs                # Peer 连接管理 ✅
 │   ├── seeder.rs              # 上传服务 ✅
-│   └── downloader.rs          # 下载客户端 ✅
+│   ├── downloader.rs          # 下载客户端 ✅
+│   └── metadata.rs            # 元数据服务器 ✅
 │
 ├── ui/                        # TUI 界面模块
 │   ├── mod.rs
@@ -96,7 +103,7 @@ pub struct DeviceInfo {
 pub struct SharedFile {
     pub name: String,       // 文件名
     pub info_hash: String,  // Info Hash (40位十六进制)
-    pub size: Option<u64>,  // 文件大小
+    pub size: Option<u64>,  // 文件大小（字节）
 }
 ```
 
@@ -123,6 +130,7 @@ pub fn register_service(config: ServiceConfig) -> Result<ServiceHandle>;
 | 组件 | 协议 | 端口 | 说明 |
 |------|------|------|------|
 | 文件传输 | BitTorrent | 6881 (默认) | 点对点文件传输 |
+| 元数据分发 | HTTP | 8080 | Torrent 元数据服务器 |
 | 服务类型 | DNS-SD | - | `_shareself._tcp.local` |
 
 ### BitTorrent 模块架构
@@ -130,21 +138,26 @@ pub fn register_service(config: ServiceConfig) -> Result<ServiceHandle>;
 ```
 torrent/
 ├── metainfo.rs      # .torrent 文件格式
+├── bencode.rs       # Bencode 编解码
 ├── piece.rs         # Piece 管理和磁盘 I/O
 ├── protocol.rs      # BitWire 协议实现
 ├── peer.rs          # Peer 连接管理
 ├── seeder.rs        # 上传服务（Seed）
-└── downloader.rs    # 下载客户端（Leech）
+├── downloader.rs    # 下载客户端（Leech）
+└── metadata.rs      # 元数据服务器
 ```
 
 **核心功能：**
 - ✅ Torrent 文件创建（.torrent）
+- ✅ Bencode 编码/解码
 - ✅ Piece 管理（分块、验证、存储）
 - ✅ BitWire 协议实现（握手、消息交换）
-- ✅ Seeder（上传服务）
-- ✅ Downloader（下载客户端）
+- ✅ Seeder（上传服务）：响应 peer 请求，发送 piece 数据
+- ✅ Downloader（下载客户端）：连接 seeder，下载文件
 - ✅ SHA1 完整性校验
-- ✅ 动态 TXT 记录更新（广播共享文件）
+- ✅ 元数据服务器：自动分发 torrent 元数据
+- ✅ 动态 TXT 记录更新（广播共享文件和大小）
+- ✅ 实时下载进度跟踪（百分比和字节数）
 
 ---
 
@@ -158,6 +171,9 @@ torrent/
 - 📱 设备列表 - 显示局域网内的设备
 - 📁 文件浏览器 - 浏览本地文件系统
 - 📤 传输列表 - 管理上传和下载任务
+  - 显示文件大小
+  - 显示已下载/总字节数
+  - 显示下载百分比进度
 
 **快捷键：**
 ```
@@ -227,6 +243,7 @@ cargo run --release
    在共享文件列表中选择文件
    按 Enter 或 d 开始下载
    按 t 查看传输进度
+   下载的文件保存在 /tmp/shareself_downloads/
    ```
 
 ---
@@ -239,9 +256,10 @@ cargo run --release
 > - ✅ 设备发现服务（注册、浏览、解析）
 > - ✅ BitTorrent 文件传输协议
 > - ✅ TUI 交互式界面
-> - ✅ 文件共享和下载功能
-> - ✅ 动态 mDNS TXT 记录更新
-> - ✅ 实时传输进度显示
+> - ✅ 文件共享功能
+> - ✅ 文件下载功能（完整实现）
+> - ✅ 元数据服务器
+> - ✅ 实时传输进度显示（百分比 + 字节数）
 
 ### 已实现功能
 
@@ -255,32 +273,23 @@ cargo run --release
 
 #### Phase 2: 文件传输 ✅
 - [x] BitTorrent 协议实现
+- [x] Bencode 编码/解码
 - [x] Torrent 文件创建
 - [x] Piece 管理和验证
+- [x] SHA1 完整性校验
 - [x] Seeder（上传服务）
 - [x] Downloader（下载客户端）
-- [x] SHA1 完整性校验
-- [x] 动态 TXT 记录更新
+- [x] 元数据服务器
+- [x] 动态 TXT 记录更新（包含文件大小）
+- [x] 实时下载进度跟踪
 
 #### Phase 3: TUI 界面 ✅
 - [x] 设备列表显示
 - [x] 文件浏览器
 - [x] 传输任务管理
-- [x] 实时进度显示
 - [x] 文件共享功能
 - [x] 文件下载功能
-
-### 已知问题
-
-#### Android/Termux 权限限制
-
-在未 root 的 Android/Termux 环境中：
-- 程序可以正常编译和运行
-- TUI 界面完全可用
-- 文件共享功能正常（通过 seeder 广播）
-- mDNS 功能受限（无法绑定 5353 端口或发送组播）
-
-**建议：** 在桌面环境（Linux/macOS/Windows）测试完整的 mDNS 设备发现功能。
+- [x] 实时进度显示（百分比和字节数）
 
 ---
 
@@ -379,12 +388,14 @@ cargo run --bin shareself
 - [x] Torrent 文件支持
 - [x] Piece 管理和验证
 - [x] Seeder 和 Downloader
+- [x] 元数据服务器
+- [x] 完整下载流程
 
 ### Phase 3: TUI 界面 ✅
 - [x] 设备列表
 - [x] 文件浏览器
 - [x] 传输管理
-- [x] 进度显示
+- [x] 进度显示（百分比 + 字节数）
 
 ### Phase 4: 平台集成 (规划中)
 - [ ] C FFI 层

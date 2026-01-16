@@ -198,7 +198,7 @@ impl Downloader {
         Ok(())
     }
 
-    /// 从单个 peer 下载
+    /// 从单个 peer 下载（支持并行下载优化）
     async fn download_from_peer(
         addr: std::net::SocketAddr,
         info_hash: [u8; 20],
@@ -261,131 +261,183 @@ impl Downloader {
             return Err(Error::Other("Peer 未发送 unchoke".to_string()));
         }
 
-        // 开始下载 pieces
-        let block_size = 16 * 1024; // 16KB
-        let mut completed_count = 0;
+        // === 并行下载优化 ===
+        // 配置参数
+        let max_parallel_pieces = 4;       // 同时下载的 piece 数量
+        let max_pending_requests = 16;     // 同时未完成的 block 请求数
+        let block_size = 16 * 1024;        // 16KB block 大小
+
+        // 下载状态
+        let mut completed_pieces = std::collections::HashSet::new();
+        let mut total_downloaded_bytes = 0u64;
         let mut last_progress_time = std::time::Instant::now();
-        let mut total_downloaded_bytes = 0u64; // 总下载字节数
 
-        // 策略：按顺序下载每个需要的 piece
+        // 正在下载的 pieces: piece_index -> (data, requested_blocks, received_blocks)
+        let mut downloading_pieces: std::collections::HashMap<
+            usize,
+            (Vec<u8>, std::collections::HashSet<usize>, usize)
+        > = std::collections::HashMap::new();
+
+        // 待请求的 blocks: (piece_index, offset, length)
+        let mut pending_requests: std::vec::Vec<(usize, usize, usize)> = std::vec::Vec::new();
+
+        // 已发送但未收到响应的请求
+        let mut outstanding_requests: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+
+        // 初始化：找出所有需要下载的 pieces
+        let mut pieces_to_download: Vec<usize> = Vec::new();
         for piece_index in 0..piece_count {
-            // 检查是否已完成
             if let Some(state) = piece_manager.piece_state(piece_index).await {
-                if state == PieceState::Completed {
-                    completed_count += 1;
-                    continue;
+                if state != PieceState::Completed && peer_pieces.contains(&piece_index) {
+                    pieces_to_download.push(piece_index);
                 }
+            } else if peer_pieces.contains(&piece_index) {
+                pieces_to_download.push(piece_index);
+            }
+        }
+
+        if pieces_to_download.is_empty() {
+            tracing::info!("没有需要下载的 pieces");
+            return Ok(());
+        }
+
+        tracing::info!("需要下载 {} 个 pieces，使用并行下载 ({} pieces, {} pending requests)",
+            pieces_to_download.len(), max_parallel_pieces, max_pending_requests);
+
+        // 主下载循环
+        while completed_pieces.len() < pieces_to_download.len() {
+            // 1. 启动新的 piece 下载（如果有空间）
+            while downloading_pieces.len() < max_parallel_pieces && !pieces_to_download.is_empty() {
+                let piece_index = pieces_to_download.remove(0);
+
+                // 计算 piece 大小
+                let piece_size = if piece_index + 1 < piece_count {
+                    piece_length as usize
+                } else {
+                    let offset = (piece_index as u64) * (piece_length as u64);
+                    (total_size - offset) as usize
+                };
+
+                let num_blocks = (piece_size + block_size - 1) / block_size;
+
+                downloading_pieces.insert(
+                    piece_index,
+                    (vec![0u8; piece_size], std::collections::HashSet::new(), 0)
+                );
+
+                // 添加所有 block 到待请求队列
+                for offset in (0..piece_size).step_by(block_size) {
+                    let request_size = std::cmp::min(block_size, piece_size - offset);
+                    pending_requests.push((piece_index, offset, request_size));
+                }
+
+                tracing::debug!("启动 piece {} 下载 ({} bytes, {} blocks)",
+                    piece_index, piece_size, num_blocks);
+                piece_manager.mark_piece_downloading(piece_index).await;
             }
 
-            // 检查 peer 是否有这个 piece
-            if !peer_pieces.contains(&piece_index) {
-                tracing::warn!("Peer 没有 piece {}", piece_index);
-                continue;
-            }
+            // 2. 发送请求（保持足够数量的未完成请求）
+            while outstanding_requests.len() < max_pending_requests && !pending_requests.is_empty() {
+                let (piece_index, offset, size) = pending_requests.remove(0);
+                outstanding_requests.insert((piece_index, offset));
 
-            // 计算 piece 大小
-            let piece_size = if piece_index + 1 < piece_count {
-                piece_length as usize
-            } else {
-                // 最后一个 piece
-                let offset = (piece_index as u64) * (piece_length as u64);
-                (total_size - offset) as usize
-            };
-
-            tracing::info!("开始下载 piece {} (大小: {} bytes)", piece_index, piece_size);
-            piece_manager.mark_piece_downloading(piece_index).await;
-
-            // 分块下载
-            let mut piece_data = vec![0u8; piece_size];
-            let mut downloaded = 0;
-
-            while downloaded < piece_size {
-                let request_size = std::cmp::min(block_size, piece_size - downloaded);
-
-                // 发送请求
                 peer.request_piece(
                     piece_index as u32,
-                    downloaded as u32,
-                    request_size as u32,
+                    offset as u32,
+                    size as u32,
                 ).await?;
+            }
 
-                // 等待响应
-                match timeout(Duration::from_secs(30), peer.recv()).await {
-                    Ok(Ok(Message::Piece { index, begin, block })) => {
-                        if index as usize == piece_index && begin as usize == downloaded {
-                            // 复制数据
-                            let start = downloaded;
-                            let end = downloaded + block.len();
-                            if end <= piece_size {
-                                piece_data[start..end].copy_from_slice(&block);
-                                downloaded += block.len();
+            // 3. 等待响应（带超时）
+            match timeout(Duration::from_secs(30), peer.recv()).await {
+                Ok(Ok(Message::Piece { index, begin, block })) => {
+                    let piece_index = index as usize;
+                    let offset = begin as usize;
 
-                                // 发送进度更新
-                                let percent = ((completed_count as f64) / (piece_count as f64)) * 100.0;
-                                if last_progress_time.elapsed() >= Duration::from_millis(500) {
-                                    let _ = event_tx.send(DownloadEvent::Progress {
-                                        percent: ((completed_count as f64 + (downloaded as f64) / (piece_size as f64)) / (piece_count as f64)) * 100.0,
-                                    }).await;
-                                    last_progress_time = std::time::Instant::now();
+                    // 移除未完成请求标记
+                    outstanding_requests.remove(&(piece_index, offset));
+
+                    // 处理收到的 block
+                    if let Some((piece_data, received_blocks, downloaded)) = downloading_pieces.get_mut(&piece_index) {
+                        if offset + block.len() <= piece_data.len() {
+                            piece_data[offset..offset + block.len()].copy_from_slice(&block);
+                            received_blocks.insert(offset);
+                            *downloaded += block.len();
+
+                            // 检查 piece 是否完成
+                            let piece_size = piece_data.len();
+                            let num_blocks = (piece_size + block_size - 1) / block_size;
+
+                            if received_blocks.len() == num_blocks {
+                                // Piece 完成，校验并存储
+                                tracing::info!("Piece {} 下载完成，正在校验...", piece_index);
+
+                                match piece_manager.store_piece(piece_index, piece_data).await {
+                                    Ok(_) => {
+                                        tracing::info!("Piece {} 校验通过并已存储", piece_index);
+                                        completed_pieces.insert(piece_index);
+                                        total_downloaded_bytes += piece_size as u64;
+
+                                        // 发送事件
+                                        let _ = event_tx.send(DownloadEvent::PieceCompleted {
+                                            index: piece_index,
+                                            downloaded_bytes: total_downloaded_bytes,
+                                        }).await;
+
+                                        let _ = event_tx.send(DownloadEvent::BytesProgress {
+                                            downloaded_bytes: total_downloaded_bytes,
+                                            total_bytes: total_size,
+                                        }).await;
+
+                                        peer.send_have(piece_index).await?;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Piece {} 校验失败: {}", piece_index, e);
+                                        return Err(Error::Other(format!("Piece {} 校验失败: {}", piece_index, e)));
+                                    }
                                 }
-                            } else {
-                                tracing::warn!("Piece 数据越界");
+
+                                // 移除已完成 piece
+                                downloading_pieces.remove(&piece_index);
                             }
                         } else {
-                            tracing::warn!("收到的 piece 数据不匹配");
+                            tracing::warn!("Piece {} block 数据越界", piece_index);
                         }
+                    } else {
+                        tracing::warn!("收到未知 piece {} 的 block", piece_index);
                     }
-                    Ok(Ok(msg)) => {
-                        tracing::debug!("收到其他消息: {:?}", std::mem::discriminant(&msg));
-                    }
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        tracing::warn!("请求超时，重试...");
-                        // 重试
-                        continue;
-                    }
-                }
-            }
-
-            // 校验并存储 piece
-            tracing::info!("Piece {} 下载完成，正在校验...", piece_index);
-
-            match piece_manager.store_piece(piece_index, &piece_data).await {
-                Ok(_) => {
-                    tracing::info!("Piece {} 校验通过并已存储", piece_index);
-                    completed_count += 1;
-
-                    // 更新总下载字节数
-                    total_downloaded_bytes += piece_size as u64;
-
-                    // 发送 piece 完成事件（包含已下载字节数）
-                    let _ = event_tx.send(DownloadEvent::PieceCompleted {
-                        index: piece_index,
-                        downloaded_bytes: total_downloaded_bytes,
-                    }).await;
-
-                    // 发送字节进度事件
-                    let _ = event_tx.send(DownloadEvent::BytesProgress {
-                        downloaded_bytes: total_downloaded_bytes,
-                        total_bytes: total_size,
-                    }).await;
 
                     // 发送进度更新
-                    let percent = ((completed_count as f64) / (piece_count as f64)) * 100.0;
-                    let _ = event_tx.send(DownloadEvent::Progress { percent }).await;
+                    if last_progress_time.elapsed() >= Duration::from_millis(200) {
+                        let percent = ((completed_pieces.len() as f64) / (piece_count as f64)) * 100.0;
+                        let _ = event_tx.send(DownloadEvent::Progress { percent }).await;
+                        last_progress_time = std::time::Instant::now();
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("Piece {} 校验失败: {}", piece_index, e);
-                    return Err(Error::Other(format!("Piece {} 校验失败: {}", piece_index, e)));
+                Ok(Ok(msg)) => {
+                    tracing::debug!("收到其他消息: {:?}", std::mem::discriminant(&msg));
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    tracing::warn!("接收消息超时，重试未完成的请求");
+                    // 超时：重发未完成的请求
+                    for (piece_index, offset) in outstanding_requests.clone() {
+                        if let Some((piece_data, _, _)) = downloading_pieces.get(&piece_index) {
+                            let remaining = piece_data.len() - offset;
+                            let request_size = std::cmp::min(block_size, remaining);
+                            peer.request_piece(
+                                piece_index as u32,
+                                offset as u32,
+                                request_size as u32,
+                            ).await?;
+                        }
+                    }
                 }
             }
 
-            // 发送 have 消息
-            peer.send_have(piece_index).await?;
-
-            // 检查是否全部完成
-            if completed_count == piece_count {
-                tracing::info!("所有 pieces 下载完成!");
+            // 检查是否所有 pieces 都完成
+            if completed_pieces.len() == piece_count {
+                tracing::info!("所有 {} 个 pieces 下载完成!", completed_pieces.len());
                 break;
             }
         }
