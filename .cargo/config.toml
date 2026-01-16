@@ -1,0 +1,28 @@
+[target.aarch64-linux-android]
+ar = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+linker = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android28-clang"
+
+[target.armv7-linux-androideabi]
+ar = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+linker = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/armv7a-linux-androideabi28-clang"
+
+[target.x86_64-linux-android]
+ar = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+linker = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/x86_64-linux-android28-clang"
+
+[env]
+# cc-rs 需要的环境变量格式
+CC_aarch64_linux_android = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android28-clang"
+CXX_aarch64_linux_android = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android28-clang"
+AR_aarch64_linux_android = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android28-clang"
+
+CC_armv7_linux_androideabi = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/armv7a-linux-androideabi28-clang"
+CXX_armv7_linux_androideabi = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/armv7a-linux-androideabi28-clang"
+AR_armv7_linux_androideabi = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/armv7a-linux-androideabi28-clang"
+
+CC_x86_64_linux_android = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/x86_64-linux-android28-clang"
+CXX_x86_64_linux_android = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/x86_64-linux-android28-clang"
+AR_x86_64_linux_android = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER = "/Users/ex-hezhihu870/develop/android/sdk/ndk/28.0.13004108/toolchains/llvm/prebuilt/darwin-x86_64/bin/x86_64-linux-android28-clang"

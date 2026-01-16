@@ -7,6 +7,14 @@ pub mod common;
 pub mod discovery;
 pub mod mdns;
 
+// SDK 模块
+pub mod sdk;
+pub mod sdk_main;
+
+// FFI 模块
+pub mod ffi;
+pub mod sdk_ffi;  // 新 SDK FFI 层
+
 // BitTorrent 传输模块
 pub mod torrent;
 

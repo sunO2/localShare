@@ -32,15 +32,38 @@ anyhow = "1"
 # 日志
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4"
+
+# Android 日志
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.13"
+jni = { version = "0.21", optional = true }
+ndk-glue = { version = "0.7", optional = true }
 
 # 工具
 once_cell = "1.19"
 gethostname = "0.4"
-get_if_addrs = "0.1"
 walkdir = "2.4"
 sha1 = "0.10"
 rand = "0.8"
 hex = "0.4"
+
+# HTTP 客户端 (纯 Rust，无 OpenSSL 依赖)
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+
+# 异步 HTTP 客户端 (用于文件传输)
+reqwest = { version = "0.11", default-features = false, features = ["multipart", "stream"] }
+
+# HTTP 服务器
+warp = { version = "0.3", default-features = false }
+tokio-util = { version = "0.7", features = ["io"] }
+bytes = "1"
+
+# MIME 类型检测
+mime_guess = "2"
+
+# 网络接口
+local-ip-address = "0.6"
 
 # TUI 界面
 ratatui = "0.26"
@@ -55,11 +78,6 @@ tokio-test = "0.4"
 
 [build-dependencies]
 cbindgen = "0.26"
-
-# Android 特定配置
-[target.'cfg(target_os = "android")'.dependencies]
-jni = { version = "0.21", optional = true }
-ndk-glue = { version = "0.7", optional = true }
 
 [features]
 default = []
