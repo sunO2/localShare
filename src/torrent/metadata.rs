@@ -3,7 +3,7 @@
 //! 为下载者提供 torrent 元数据
 
 use crate::common::error::{Error, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -11,10 +11,19 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{info, warn, error};
 
+/// Torrent 白名单信息
+#[derive(Clone)]
+pub struct TorrentWhitelist {
+    /// 允许的 IP 地址集合
+    pub allowed_ips: HashSet<String>,
+}
+
 /// 元数据服务器
 pub struct MetadataServer {
     /// torrent 数据 (info_hash -> torrent_data)
     torrents: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    /// 白名单 (info_hash -> whitelist)
+    whitelists: Arc<RwLock<HashMap<String, TorrentWhitelist>>>,
     /// 是否运行
     running: Arc<RwLock<bool>>,
 }
@@ -24,6 +33,7 @@ impl MetadataServer {
     pub fn new() -> Self {
         MetadataServer {
             torrents: Arc::new(RwLock::new(HashMap::new())),
+            whitelists: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(RwLock::new(false)),
         }
     }
@@ -52,7 +62,33 @@ impl MetadataServer {
     /// 移除 torrent
     pub async fn remove_torrent(&self, info_hash: &str) {
         let mut torrents = self.torrents.write().await;
+        let mut whitelists = self.whitelists.write().await;
         torrents.remove(info_hash);
+        whitelists.remove(info_hash);
+    }
+
+    /// 设置白名单
+    pub async fn set_whitelist(&self, info_hash: String, whitelist: HashSet<String>) {
+        let mut whitelists = self.whitelists.write().await;
+        whitelists.insert(info_hash.clone(), TorrentWhitelist { allowed_ips: whitelist });
+        info!("已设置白名单: hash={}, 受限设备数={}", info_hash, whitelists.len());
+    }
+
+    /// 获取白名单
+    pub async fn get_whitelist(&self, info_hash: &str) -> Option<TorrentWhitelist> {
+        let whitelists = self.whitelists.read().await;
+        whitelists.get(info_hash).cloned()
+    }
+
+    /// 检查 IP 是否在白名单中
+    pub async fn is_ip_allowed(&self, info_hash: &str, ip: &str) -> bool {
+        let whitelists = self.whitelists.read().await;
+        if let Some(whitelist) = whitelists.get(info_hash) {
+            whitelist.allowed_ips.contains(&ip.to_string())
+        } else {
+            // 没有设置白名单，表示允许所有人
+            true
+        }
     }
 
     /// 启动元数据服务器
@@ -70,6 +106,7 @@ impl MetadataServer {
         info!("元数据服务器启动，监听: {}", addr);
 
         let torrents = Arc::clone(&self.torrents);
+        let whitelists = Arc::clone(&self.whitelists);
         let running = Arc::clone(&self.running);
 
         loop {
@@ -85,8 +122,9 @@ impl MetadataServer {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     let torrents = Arc::clone(&torrents);
+                    let whitelists = Arc::clone(&whitelists);
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_client(stream, peer_addr, torrents).await {
+                        if let Err(e) = Self::handle_client(stream, peer_addr, torrents, whitelists).await {
                             error!("处理元数据请求失败 {}: {}", peer_addr, e);
                         }
                     });
@@ -111,6 +149,7 @@ impl MetadataServer {
         mut stream: tokio::net::TcpStream,
         peer_addr: SocketAddr,
         torrents: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+        whitelists: Arc<RwLock<HashMap<String, TorrentWhitelist>>>,
     ) -> Result<()> {
         let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
@@ -131,6 +170,26 @@ impl MetadataServer {
         } else {
             return Err(Error::Other("Invalid request format".to_string()));
         };
+
+        // 检查白名单
+        let peer_ip = peer_addr.ip().to_string();
+        let is_allowed = {
+            let whitelists = whitelists.read().await;
+            if let Some(whitelist) = whitelists.get(&info_hash) {
+                whitelist.allowed_ips.contains(&peer_ip)
+            } else {
+                // 没有设置白名单，允许所有人
+                true
+            }
+        };
+
+        if !is_allowed {
+            warn!("访问被拒绝: {} 不在 torrent {} 的白名单中", peer_addr, info_hash);
+            // 发送 0 长度表示未授权
+            writer.write_all(&0u32.to_be_bytes()).await
+                .map_err(|e| Error::Network(format!("Failed to write unauthorized: {}", e)))?;
+            return Ok(());
+        }
 
         // 查找 torrent 数据
         let torrent_data = {

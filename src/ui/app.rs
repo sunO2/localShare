@@ -77,7 +77,7 @@ pub struct TransferTask {
 #[derive(Debug, Clone)]
 pub enum TransferEvent {
     /// 共享开始
-    ShareStarted { id: usize, path: PathBuf },
+    ShareStarted { id: usize, path: PathBuf, allowed_devices: Option<std::collections::HashSet<String>> },
     /// 共享完成
     ShareCompleted { id: usize, info_hash: String },
     /// 共享失败
@@ -630,10 +630,37 @@ impl App {
         let task_id = self.allocate_task_id();
         tracing::info!("分配任务 ID: {}", task_id);
 
+        // 获取选中的设备白名单
+        let allowed_devices = if self.selected_devices.is_empty() {
+            None
+        } else {
+            // 将设备名转换为对应的 IP 地址集合
+            let mut allowed_ips = std::collections::HashSet::new();
+            for device in &self.devices {
+                if self.selected_devices.contains(&device.name) {
+                    // 获取设备的 IP 地址
+                    if let Some(ip) = device.get_txt_value("ip") {
+                        allowed_ips.insert(ip.clone());
+                        tracing::info!("添加允许的设备: {} -> {}", device.name, ip);
+                    }
+                }
+            }
+            if allowed_ips.is_empty() {
+                None
+            } else {
+                Some(allowed_ips)
+            }
+        };
+
+        let peer_display = match &allowed_devices {
+            Some(ips) => format!("{} 个设备", ips.len()),
+            None => "所有人".to_string(),
+        };
+
         // 创建传输任务
         let task = TransferTask {
             name: item_name.clone(),
-            peer: "所有人".to_string(),
+            peer: peer_display,
             size: item_size,
             status: TransferStatus::Preparing,
             is_upload: true,
@@ -642,10 +669,11 @@ impl App {
         };
         self.transfers.push(task);
 
-        // 发送共享开始事件（克隆 path 避免移动）
+        // 发送共享开始事件（包含白名单）
         match self.transfer_tx.try_send(TransferEvent::ShareStarted {
             id: task_id,
             path: item_path.clone(),
+            allowed_devices,
         }) {
             Ok(_) => tracing::info!("✓ ShareStarted 事件已发送"),
             Err(e) => tracing::error!("✗ 发送 ShareStarted 事件失败: {}", e),
@@ -730,7 +758,7 @@ impl App {
         if let Some(rx) = &mut self.transfer_rx {
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    TransferEvent::ShareStarted { id, path } => {
+                    TransferEvent::ShareStarted { id, path, allowed_devices: _ } => {
                         tracing::info!("共享开始: id={}, path={:?}", id, path);
                         // 更新任务状态
                         if let Some(task) = self.transfers.iter_mut().find(|t| t.id == id) {
@@ -1271,18 +1299,34 @@ async fn transfer_service_handler(
     shared_files_tx: mpsc::Sender<(String, (String, u64))>, // (文件名, (info_hash, 文件大小))
 ) {
     let mut pending_shares: HashMap<usize, PathBuf> = HashMap::new();
+    let mut pending_whitelists: HashMap<usize, std::collections::HashSet<String>> = HashMap::new();
+    let mut pending_whitelist_options: HashMap<usize, bool> = HashMap::new(); // true = 有白名单限制
     let mut active_seeders: HashMap<PathBuf, (Arc<TorrentFile>, tokio::task::JoinHandle<()>)> = HashMap::new();
     let mut active_downloads: HashMap<usize, tokio::task::JoinHandle<()>> = HashMap::new();
 
     while let Some(event) = rx.recv().await {
         match event {
-            TransferEvent::ShareStarted { id, path } => {
+            TransferEvent::ShareStarted { id, path, allowed_devices } => {
                 tracing::info!("=== 收到 ShareStarted 事件 ===");
                 tracing::info!("任务 ID: {}", id);
                 tracing::info!("文件路径: {:?}", path);
+                if let Some(devices) = &allowed_devices {
+                    tracing::info!("白名单设备: {:?}", devices);
+                } else {
+                    tracing::info!("无白名单限制（所有人可下载）");
+                }
 
-                // 保存路径以便后续使用
+                // 保存路径和白名单以便后续使用
                 pending_shares.insert(id, path.clone());
+                match allowed_devices {
+                    Some(devices) => {
+                        pending_whitelists.insert(id, devices);
+                        pending_whitelist_options.insert(id, true);
+                    }
+                    None => {
+                        pending_whitelist_options.insert(id, false);
+                    }
+                }
 
                 // 创建种子服务
                 tracing::info!("正在创建 TorrentFile...");
@@ -1311,6 +1355,22 @@ async fn transfer_service_handler(
                         global_metadata_server().add_torrent(info_hash.clone(), torrent_data).await;
                         tracing::info!("✓ 已注册到元数据服务器");
 
+                        // 获取并删除白名单
+                        let has_whitelist = pending_whitelist_options.remove(&id).unwrap_or(false);
+                        let whitelist = if has_whitelist {
+                            pending_whitelists.remove(&id)
+                        } else {
+                            None
+                        };
+
+                        // 设置元数据服务器白名单（如果有）
+                        if let Some(ref allowed_ips) = whitelist {
+                            global_metadata_server().set_whitelist(info_hash.clone(), allowed_ips.clone()).await;
+                            tracing::info!("✓ 已设置元数据服务器白名单: {} 个设备", allowed_ips.len());
+                        } else {
+                            tracing::info!("✓ 无白名单限制（所有人可下载）");
+                        }
+
                         // 创建 PieceManager
                         let storage_path = if path.is_dir() {
                             path.clone()
@@ -1335,6 +1395,7 @@ async fn transfer_service_handler(
                             torrent.metainfo.clone(),
                             piece_manager.clone(),
                             listen_addr,
+                            whitelist,
                         );
 
                         // 在后台启动 seeder

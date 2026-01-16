@@ -7,12 +7,12 @@ use crate::torrent::piece::PieceManager;
 use crate::torrent::protocol::Message;
 use crate::torrent::peer::PeerConnection;
 use crate::common::error::Result;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, IpAddr};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use std::collections::{HashMap, HashSet};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use std::collections::HashMap;
 
 /// 种子上传器
 pub struct Seeder {
@@ -30,6 +30,10 @@ pub struct Seeder {
 
     /// 是否运行
     running: Arc<RwLock<bool>>,
+
+    /// 允许连接的设备白名单 (IP 地址集合)
+    /// None 表示允许所有设备连接
+    allowed_devices: Option<HashSet<String>>,
 }
 
 impl Seeder {
@@ -38,6 +42,7 @@ impl Seeder {
         metainfo: TorrentMetaInfo,
         piece_manager: Arc<PieceManager>,
         listen_addr: SocketAddr,
+        allowed_devices: Option<HashSet<String>>,
     ) -> Self {
         Seeder {
             metainfo,
@@ -45,6 +50,7 @@ impl Seeder {
             listen_addr,
             peers: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(RwLock::new(false)),
+            allowed_devices,
         }
     }
 
@@ -68,6 +74,7 @@ impl Seeder {
         let piece_manager = Arc::clone(&self.piece_manager);
         let peers = Arc::clone(&self.peers);
         let running = Arc::clone(&self.running);
+        let allowed_devices = self.allowed_devices.clone();
 
         loop {
             // 检查是否应该停止
@@ -85,6 +92,7 @@ impl Seeder {
                     let peer_id = peer_id;
                     let piece_manager = Arc::clone(&piece_manager);
                     let peers = Arc::clone(&peers);
+                    let allowed_devices = allowed_devices.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_peer(
@@ -93,6 +101,7 @@ impl Seeder {
                             info_hash,
                             peer_id,
                             piece_manager,
+                            allowed_devices,
                         ).await {
                             tracing::warn!("Peer {} error: {}", addr, e);
                         }
@@ -117,10 +126,23 @@ impl Seeder {
         info_hash: [u8; 20],
         peer_id: [u8; 20],
         piece_manager: Arc<PieceManager>,
+        allowed_devices: Option<HashSet<String>>,
     ) -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        tracing::debug!("Seeder: 接受来自 {} 的连接", addr);
+        // 验证白名单
+        if let Some(allowed) = &allowed_devices {
+            let peer_ip = addr.ip().to_string();
+            if !allowed.contains(&peer_ip) {
+                tracing::warn!("拒绝连接：{} 不在白名单中", addr);
+                return Err(crate::common::error::Error::Other(
+                    format!("Connection from {} not in whitelist", addr)
+                ));
+            }
+            tracing::info!("接受连接：{} (在白名单中)", addr);
+        } else {
+            tracing::debug!("Seeder: 接受来自 {} 的连接", addr);
+        }
 
         let (mut reader, mut writer) = socket.into_split();
 

@@ -503,6 +503,7 @@ async fn run_share_file() -> sharSelf::Result<()> {
         torrent.metainfo.clone(),
         piece_manager.clone(),
         listen_addr,
+        None, // 无白名单限制
     );
 
     println!("✅ 种子服务已启动！\n");
