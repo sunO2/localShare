@@ -359,7 +359,12 @@ impl App {
                 addresses: Vec::new(), // 本地设备不需要地址
                 port: 8080,
                 txt_records: self.shared_files.iter()
-                    .map(|(name, hash)| (format!("file_{}", name), hash.clone()))
+                    .flat_map(|(name, (hash, size))| {
+                        vec![
+                            (format!("file_{}", name), hash.clone()),
+                            (format!("size_{}", name), size.to_string()),
+                        ]
+                    })
                     .collect(),
                 service_type: sharSelf::DEFAULT_SERVICE_TYPE.to_string(),
                 last_seen: std::time::Instant::now(),
@@ -430,14 +435,14 @@ impl App {
                     // 如果是自己的设备，直接使用内部共享文件列表
                     if device.name == self.local_hostname {
                         tracing::info!("Viewing own device. Shared files count: {}", self.shared_files.len());
-                        for (name, hash) in &self.shared_files {
-                            tracing::info!("  - File: {}, Hash: {}", name, hash);
+                        for (name, (hash, size)) in &self.shared_files {
+                            tracing::info!("  - File: {}, Hash: {}, Size: {} bytes", name, hash, size);
                         }
                         self.device_shared_files = self.shared_files.iter()
-                            .map(|(name, hash)| SharedFile {
+                            .map(|(name, (hash, size))| SharedFile {
                                 name: name.clone(),
                                 info_hash: hash.clone(),
-                                size: None,
+                                size: Some(*size),
                             })
                             .collect();
                         tracing::info!("Loaded {} shared files for display", self.device_shared_files.len());
@@ -738,12 +743,13 @@ impl App {
                             task.status = TransferStatus::Uploading { progress: 0.0 };
                             task.peer = format!("Hash: {}", &info_hash[..16]);
 
-                            // 添加到共享文件列表
-                            self.shared_files.insert(task.name.clone(), info_hash.clone());
+                            // 添加到共享文件列表（包含文件大小）
+                            self.shared_files.insert(task.name.clone(), (info_hash.clone(), task.size));
 
                             tracing::info!("=== 共享文件已添加到列表 ===");
                             tracing::info!("文件名: {}", task.name);
                             tracing::info!("Info Hash: {}", info_hash);
+                            tracing::info!("文件大小: {} bytes", task.size);
                             tracing::info!("当前共享文件总数: {}", self.shared_files.len());
 
                             // 标记需要广播
