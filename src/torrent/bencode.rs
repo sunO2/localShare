@@ -130,9 +130,9 @@ impl BencodeValue {
         }
 
         let end = data[1..].iter().position(|&b| b == b'e')
-            .ok_or_else(|| "Unterminated int".to_string())? + 1;
+            .ok_or_else(|| "Unterminated int".to_string())?;
 
-        let num_str = std::str::from_utf8(&data[1..=end])
+        let num_str = std::str::from_utf8(&data[1..end + 1])
             .map_err(|_| "Invalid UTF-8 in int".to_string())?;
 
         let value = num_str.parse::<i64>()
