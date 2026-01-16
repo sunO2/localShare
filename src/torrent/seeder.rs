@@ -120,24 +120,35 @@ impl Seeder {
     ) -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+        tracing::debug!("Seeder: 接受来自 {} 的连接", addr);
+
         let (mut reader, mut writer) = socket.into_split();
 
         // 接收握手
         let mut handshake_bytes = vec![0u8; 68];
+        tracing::debug!("Seeder: 等待握手数据...");
         reader.read_exact(&mut handshake_bytes).await
             .map_err(|e| crate::common::error::Error::Network(format!("Failed to read handshake: {}", e)))?;
+
+        tracing::debug!("Seeder: 收到握手数据，解析中...");
 
         let handshake = crate::torrent::protocol::Handshake::from_bytes(&handshake_bytes)?;
 
         // 验证 info hash
         if handshake.info_hash != info_hash {
+            tracing::warn!("Seeder: Info hash 不匹配");
             return Err(crate::common::error::Error::Other("Info hash mismatch".to_string()));
         }
+
+        tracing::debug!("Seeder: Info hash 匹配，发送响应握手");
 
         // 发送握手
         let response_handshake = crate::torrent::protocol::Handshake::new(info_hash, peer_id);
         let handshake_data = response_handshake.to_bytes();
         writer.write_all(&handshake_data).await?;
+        writer.flush().await?;
+
+        tracing::debug!("Seeder: 握手完成，发送 bitfield");
 
         // 发送 bitfield
         let bitmap = piece_manager.bitmap().await;

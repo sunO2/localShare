@@ -39,14 +39,20 @@ impl PeerConnection {
         info_hash: [u8; 20],
         peer_id: [u8; 20],
     ) -> Result<Self> {
+        tracing::debug!("PeerConnection::connect: 连接到 {}", addr);
+
         // 连接到 peer
         let socket = TcpStream::connect(addr)
             .await
             .map_err(|e| Error::Network(format!("Failed to connect to {}: {}", addr, e)))?;
 
+        tracing::debug!("PeerConnection::connect: TCP 连接成功，发送握手");
+
         // 发送握手
         let handshake = Handshake::new(info_hash, peer_id);
         let handshake_bytes = handshake.to_bytes();
+
+        tracing::debug!("PeerConnection::connect: 握手数据长度: {} 字节", handshake_bytes.len());
 
         let (mut reader, mut writer) = socket.into_split();
 
@@ -55,6 +61,8 @@ impl PeerConnection {
         writer.flush().await
             .map_err(|e| Error::Network(format!("Failed to flush handshake: {}", e)))?;
 
+        tracing::debug!("PeerConnection::connect: 握手已发送，等待响应...");
+
         // 接收握手
         let mut recv_handshake = vec![0u8; 68];
         timeout(Duration::from_secs(10), reader.read_exact(&mut recv_handshake))
@@ -62,12 +70,16 @@ impl PeerConnection {
             .map_err(|_| Error::Timeout)?
             .map_err(|e| Error::Network(format!("Failed to receive handshake: {}", e)))?;
 
+        tracing::debug!("PeerConnection::connect: 收到握手响应，解析中...");
+
         let recv_handshake = Handshake::from_bytes(&recv_handshake)?;
 
         // 验证 info hash
         if recv_handshake.info_hash != info_hash {
             return Err(Error::Other("Info hash mismatch".to_string()));
         }
+
+        tracing::debug!("PeerConnection::connect: 握手成功！");
 
         let peer_id = recv_handshake.peer_id;
 
