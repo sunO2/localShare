@@ -126,7 +126,7 @@ impl BencodeValue {
     /// 解码整数
     fn decode_int(data: &[u8]) -> Result<(BencodeValue, usize), String> {
         if data.is_empty() || data[0] != b'i' {
-            return Err("Invalid int".to_string());
+            return Err(format!("Invalid int: expected 'i', got {:?}", data.first()));
         }
 
         let end = data[1..].iter().position(|&b| b == b'e')
@@ -136,7 +136,7 @@ impl BencodeValue {
             .map_err(|_| "Invalid UTF-8 in int".to_string())?;
 
         let value = num_str.parse::<i64>()
-            .map_err(|_| "Invalid integer".to_string())?;
+            .map_err(|e| format!("Invalid integer: '{}' - {}", num_str, e))?;
 
         Ok((BencodeValue::Int(value), end + 2)) // +2 for 'i' and 'e'
     }

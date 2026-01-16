@@ -1401,6 +1401,9 @@ async fn transfer_service_handler(
                     };
 
                     // 步骤 2: 解析元数据
+                    tracing::debug!("原始 bencode 数据 (hex): {}", hex::encode(&metadata_data));
+                    tracing::debug!("原始 bencode 数据 (前 200 字节): {:?}", String::from_utf8_lossy(&metadata_data[..metadata_data.len().min(200)]));
+
                     let metainfo = match TorrentMetaInfo::from_bencode(&metadata_data) {
                         Ok(m) => {
                             tracing::info!("成功解析元数据: {} ({})",
@@ -1409,6 +1412,7 @@ async fn transfer_service_handler(
                         }
                         Err(e) => {
                             tracing::error!("解析元数据失败: {}", e);
+                            tracing::error!("完整 bencode 数据 (hex): {}", hex::encode(&metadata_data));
                             let _ = tx_clone.send(TransferEvent::DownloadFailed {
                                 id,
                                 reason: format!("解析元数据失败: {}", e),
