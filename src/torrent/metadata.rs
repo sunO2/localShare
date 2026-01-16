@@ -31,8 +31,16 @@ impl MetadataServer {
     /// 添加 torrent
     pub async fn add_torrent(&self, info_hash: String, data: Vec<u8>) {
         let mut torrents = self.torrents.write().await;
-        torrents.insert(info_hash, data);
-        info!("已添加 torrent 到元数据服务器");
+        let data_len = data.len();
+        torrents.insert(info_hash.clone(), data);
+        info!("已添加 torrent 到元数据服务器: hash={}, size={} bytes", info_hash, data_len);
+        info!("当前存储的 torrent 数量: {}", torrents.len());
+
+        // 打印所有已存储的 hash（调试用）
+        let hashes: Vec<_> = torrents.keys().collect();
+        if !hashes.is_empty() {
+            info!("已存储的 hash 列表: {:?}", hashes);
+        }
     }
 
     /// 获取 torrent 数据
@@ -127,6 +135,14 @@ impl MetadataServer {
         // 查找 torrent 数据
         let torrent_data = {
             let torrents = torrents.read().await;
+            info!("元数据服务器当前存储 {} 个 torrent", torrents.len());
+
+            // 打印所有已存储的 hash（调试用）
+            let hashes: Vec<_> = torrents.keys().collect();
+            if !hashes.is_empty() {
+                info!("已存储的 hash 列表: {:?}", hashes);
+            }
+
             torrents.get(&info_hash).cloned()
         };
 
