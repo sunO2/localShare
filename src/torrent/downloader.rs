@@ -21,7 +21,7 @@ pub enum DownloadEvent {
     Connected { peer: String },
 
     /// Piece 下载完成
-    PieceCompleted { index: usize },
+    PieceCompleted { index: usize, downloaded_bytes: u64 },
 
     /// 下载完成
     DownloadComplete,
@@ -31,6 +31,9 @@ pub enum DownloadEvent {
 
     /// 进度更新 (百分比 0.0-100.0)
     Progress { percent: f64 },
+
+    /// 字节进度更新
+    BytesProgress { downloaded_bytes: u64, total_bytes: u64 },
 
     /// Peer 断开连接
     PeerDisconnected { peer: String },
@@ -262,6 +265,7 @@ impl Downloader {
         let block_size = 16 * 1024; // 16KB
         let mut completed_count = 0;
         let mut last_progress_time = std::time::Instant::now();
+        let mut total_downloaded_bytes = 0u64; // 总下载字节数
 
         // 策略：按顺序下载每个需要的 piece
         for piece_index in 0..piece_count {
@@ -351,8 +355,19 @@ impl Downloader {
                     tracing::info!("Piece {} 校验通过并已存储", piece_index);
                     completed_count += 1;
 
+                    // 更新总下载字节数
+                    total_downloaded_bytes += piece_size as u64;
+
+                    // 发送 piece 完成事件（包含已下载字节数）
                     let _ = event_tx.send(DownloadEvent::PieceCompleted {
                         index: piece_index,
+                        downloaded_bytes: total_downloaded_bytes,
+                    }).await;
+
+                    // 发送字节进度事件
+                    let _ = event_tx.send(DownloadEvent::BytesProgress {
+                        downloaded_bytes: total_downloaded_bytes,
+                        total_bytes: total_size,
                     }).await;
 
                     // 发送进度更新

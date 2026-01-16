@@ -113,16 +113,28 @@ impl DeviceInfo {
     /// 获取该设备共享的文件列表
     pub fn get_shared_files(&self) -> Vec<SharedFile> {
         let mut files = Vec::new();
+        let mut file_hashes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut file_sizes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
-        // 从 TXT 记录中查找以 "file_" 开头的记录
+        // 从 TXT 记录中提取文件信息
         for (key, value) in &self.txt_records {
             if let Some(file_name) = key.strip_prefix("file_") {
-                files.push(SharedFile {
-                    name: file_name.to_string(),
-                    info_hash: value.clone(),
-                    size: None, // 大小信息暂时不可用
-                });
+                file_hashes.insert(file_name.to_string(), value.clone());
+            } else if let Some(file_name) = key.strip_prefix("size_") {
+                if let Ok(size) = value.parse::<u64>() {
+                    file_sizes.insert(file_name.to_string(), size);
+                }
             }
+        }
+
+        // 组合文件信息
+        for (file_name, info_hash) in file_hashes {
+            let size = file_sizes.get(&file_name).copied();
+            files.push(SharedFile {
+                name: file_name,
+                info_hash,
+                size,
+            });
         }
 
         files

@@ -69,6 +69,8 @@ pub struct TransferTask {
     pub is_upload: bool,
     /// 任务 ID
     pub id: usize,
+    /// 已下载/上传的字节数
+    pub downloaded_bytes: u64,
 }
 
 /// 传输事件（用于异步通信）
@@ -84,6 +86,8 @@ pub enum TransferEvent {
     DownloadStarted { id: usize, name: String, device_addr: SocketAddr, info_hash: String },
     /// 下载进度
     DownloadProgress { id: usize, progress: f64 },
+    /// 下载字节进度
+    DownloadBytesProgress { id: usize, downloaded_bytes: u64 },
     /// 下载完成
     DownloadCompleted { id: usize },
     /// 下载失败
@@ -124,12 +128,12 @@ pub struct App {
     transfer_tx: mpsc::Sender<TransferEvent>,
     /// 传输事件接收器
     transfer_rx: Option<mpsc::Receiver<TransferEvent>>,
-    /// 共享文件信息接收器 (文件名, info_hash)
-    shared_files_rx: Option<mpsc::Receiver<(String, String)>>,
+    /// 共享文件信息接收器 (文件名, (info_hash, 文件大小))
+    shared_files_rx: Option<mpsc::Receiver<(String, (String, u64))>>,
     /// 下一个任务 ID
     next_task_id: usize,
-    /// 共享文件列表 (名称 -> info_hash)
-    shared_files: HashMap<String, String>,
+    /// 共享文件列表 (名称 -> (info_hash, 文件大小))
+    shared_files: HashMap<String, (String, u64)>,
     /// 是否需要广播共享文件
     need_broadcast: bool,
     /// 本机主机名
@@ -276,10 +280,11 @@ impl App {
             txt_records.insert("ip".to_string(), local_ip);
             txt_records.insert("bt_port".to_string(), DEFAULT_BT_PORT.to_string());
 
-            // 添加共享文件列表
-            for (name, hash) in &self.shared_files {
+            // 添加共享文件列表（包含文件大小）
+            for (name, (hash, size)) in &self.shared_files {
                 txt_records.insert(format!("file_{}", name), hash.clone());
-                tracing::info!("Broadcasting file: {} -> {}", name, hash);
+                txt_records.insert(format!("size_{}", name), size.to_string());
+                tracing::info!("Broadcasting file: {} -> {} ({} bytes)", name, hash, size);
             }
 
             // 更新 mDNS TXT 记录
@@ -366,13 +371,14 @@ impl App {
     /// 处理共享文件信息接收
     pub fn handle_shared_files_updates(&mut self) {
         if let Some(rx) = &mut self.shared_files_rx {
-            while let Ok((file_name, info_hash)) = rx.try_recv() {
+            while let Ok((file_name, (info_hash, file_size))) = rx.try_recv() {
                 tracing::info!("=== 收到共享文件更新 ===");
                 tracing::info!("文件名: {}", file_name);
                 tracing::info!("Info Hash: {}", info_hash);
+                tracing::info!("文件大小: {} bytes", file_size);
 
                 // 添加到共享文件列表
-                self.shared_files.insert(file_name.clone(), info_hash.clone());
+                self.shared_files.insert(file_name.clone(), (info_hash.clone(), file_size));
                 tracing::info!("✓ 已添加到 shared_files");
                 tracing::info!("当前共享文件总数: {}", self.shared_files.len());
 
@@ -627,6 +633,7 @@ impl App {
             status: TransferStatus::Preparing,
             is_upload: true,
             id: task_id,
+            downloaded_bytes: 0,
         };
         self.transfers.push(task);
 
@@ -695,6 +702,7 @@ impl App {
             status: TransferStatus::Preparing,
             is_upload: false,
             id: task_id,
+            downloaded_bytes: 0,
         };
         self.transfers.push(task);
 
@@ -764,6 +772,14 @@ impl App {
                             tracing::debug!("✓ 任务 {} 进度已更新", id);
                         } else {
                             tracing::warn!("✗ 未找到任务 ID {} 更新进度", id);
+                        }
+                    }
+                    TransferEvent::DownloadBytesProgress { id, downloaded_bytes } => {
+                        tracing::debug!("下载字节进度: id={}, bytes={}", id, downloaded_bytes);
+                        if let Some(task) = self.transfers.iter_mut().find(|t| t.id == id) {
+                            task.downloaded_bytes = downloaded_bytes;
+                        } else {
+                            tracing::warn!("✗ 未找到任务 ID {} 更新字节进度", id);
                         }
                     }
                     TransferEvent::DownloadCompleted { id } => {
@@ -1022,7 +1038,15 @@ impl App {
                             Style::default().fg(status_color),
                         ),
                         Span::styled(
-                            format!("{} | {}", format_size(transfer.size), format_progress(progress)),
+                            if transfer.is_upload {
+                                format!("{}", format_size(transfer.size))
+                            } else {
+                                format!("{}/{}", format_size(transfer.downloaded_bytes), format_size(transfer.size))
+                            },
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            format!(" | {}", format_progress(progress)),
                             Style::default().fg(Color::DarkGray),
                         ),
                     ]),
@@ -1202,8 +1226,8 @@ pub async fn run_tui() -> Result<()> {
     let (event_back_tx, event_back_rx) = mpsc::channel::<TransferEvent>(100);
     app.transfer_rx = Some(event_back_rx);
 
-    // 创建共享文件信息通道
-    let (shared_files_tx, shared_files_rx) = mpsc::channel::<(String, String)>(100);
+    // 创建共享文件信息通道（包含文件大小）
+    let (shared_files_tx, shared_files_rx) = mpsc::channel::<(String, (String, u64))>(100);
 
     let transfer_service = tokio::spawn(async move {
         transfer_service_handler(transfer_rx, event_back_tx, shared_files_tx).await;
@@ -1238,7 +1262,7 @@ pub async fn run_tui() -> Result<()> {
 async fn transfer_service_handler(
     mut rx: mpsc::Receiver<TransferEvent>,
     event_back_tx: mpsc::Sender<TransferEvent>, // 发送事件回主线程
-    shared_files_tx: mpsc::Sender<(String, String)>, // (文件名, info_hash)
+    shared_files_tx: mpsc::Sender<(String, (String, u64))>, // (文件名, (info_hash, 文件大小))
 ) {
     let mut pending_shares: HashMap<usize, PathBuf> = HashMap::new();
     let mut active_seeders: HashMap<PathBuf, (Arc<TorrentFile>, tokio::task::JoinHandle<()>)> = HashMap::new();
@@ -1323,9 +1347,10 @@ async fn transfer_service_handler(
                         tracing::info!("共享完成: id={}, file={}, hash={}", id, file_name, info_hash);
                         tracing::info!("✓ 发送 ShareCompleted 事件到主线程");
 
-                        // 发送共享文件信息到主线程
-                        let _ = shared_files_tx.send((file_name.clone(), info_hash.clone())).await;
-                        tracing::info!("✓ 已将共享文件信息发送到主线程: {} -> {}", file_name, info_hash);
+                        // 发送共享文件信息到主线程（包含文件大小）
+                        let file_size = torrent.metainfo.total_size();
+                        let _ = shared_files_tx.send((file_name.clone(), (info_hash.clone(), file_size))).await;
+                        tracing::info!("✓ 已将共享文件信息发送到主线程: {} -> {} ({} bytes)", file_name, info_hash, file_size);
                     }
                     Err(e) => {
                         tracing::error!("✗ TorrentFile 创建失败: {}", e);
@@ -1363,8 +1388,15 @@ async fn transfer_service_handler(
                                     Some(TransferEvent::DownloadProgress { id: task_id, progress: 0.0 })
                                 }
                                 sharSelf::torrent::downloader::DownloadEvent::PieceCompleted { .. } => {
-                                    // Piece 完成，由进度更新处理
+                                    // Piece 完成，由字节进度处理
                                     None
+                                }
+                                sharSelf::torrent::downloader::DownloadEvent::BytesProgress { downloaded_bytes, .. } => {
+                                    // 字节进度更新
+                                    Some(TransferEvent::DownloadBytesProgress {
+                                        id: task_id,
+                                        downloaded_bytes,
+                                    })
                                 }
                                 sharSelf::torrent::downloader::DownloadEvent::DownloadComplete => {
                                     Some(TransferEvent::DownloadCompleted { id: task_id })
